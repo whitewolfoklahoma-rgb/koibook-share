@@ -190,21 +190,44 @@ a.sup-buy:hover{background:var(--soft);}
    derived from its move history — never stored twice.
    ================================================================ */
 var APP_NAME = 'KoiBook';
-var APP_VERSION = '1.0';
+var APP_VERSION = '1.1';
 var TERMS_VERSION = '1.0';
 var LS_KEY = 'koibook_v1';
 var LS_TERMS_KEY = 'koibook_v1_terms';
 var SELLER_NAME = 'White Wolf Apps';
 var SELLER_EMAIL = 'whitewolfbackoffice@gmail.com';
 
-/* Koi variety library (the major nishikigoi groups). Butterfly /
-   longfin is a flag on the fish, not a variety. */
+/* Species / variety library, grouped for the picker. Koi varieties are
+   the original 20 nishikigoi groups (butterfly / longfin is a flag on
+   the fish, not a variety). Goldfish & pond fish and freshwater aquarium
+   fish get the same records as koi — and any fish at all can be typed in
+   with the custom entry. */
 var VARIETIES = [
   'Kohaku','Taisho Sanke','Showa Sanshoku','Shiro Utsuri','Hi Utsuri','Ki Utsuri',
   'Bekko','Asagi','Shusui','Koromo','Goshiki','Kujaku','Hariwake','Kikusui',
   'Yamabuki Ogon','Platinum Ogon','Orenji Ogon','Tancho','Doitsu Mix','Other / Mixed'
 ];
-function varietyName(v){ return v || 'Koi'; }
+var GOLDFISH_POND = [
+  'Common Goldfish','Comet','Sarasa Comet','Shubunkin','Wakin','Fantail','Oranda',
+  'Ranchu','Ryukin','Pearlscale','Golden Orfe','Golden Tench'
+];
+var AQUARIUM_FISH = [
+  'Angelfish','Betta','Guppy','Molly','Platy','Swordtail','Neon Tetra','Cardinal Tetra',
+  'Zebra Danio','Cherry Barb','Corydoras','Bristlenose Pleco','Discus','Oscar','Mbuna Cichlid'
+];
+var SPECIES_GROUPS = [
+  {label:'Koi varieties', items:VARIETIES},
+  {label:'Goldfish & pond fish', items:GOLDFISH_POND},
+  {label:'Aquarium fish (freshwater)', items:AQUARIUM_FISH}
+];
+var CUSTOM_VARIETY = '__custom__';
+function allVarieties(){
+  var out = [];
+  SPECIES_GROUPS.forEach(function(g){ out = out.concat(g.items); });
+  return out;
+}
+function isLibraryVariety(v){ return !!v && allVarieties().indexOf(v) >= 0; }
+function varietyName(v){ return v || 'Fish'; }
 
 var POND_TYPES = [
   {id:'main', name:'Main pond'},
@@ -235,15 +258,28 @@ var WATER_PARAMS = [
   {key:'salinity', label:'Salinity',    unit:'%',   gLo:0,   gHi:0.1, aLo:0,   aHi:0.6}
 ];
 function waterParam(key){ for (var i=0;i<WATER_PARAMS.length;i++) if (WATER_PARAMS[i].key===key) return WATER_PARAMS[i]; return null; }
-function waterFlag(key, v){
+/* A pond may carry its own good-range overrides (pond.ranges[key] =
+   {gLo, gHi}), set on the pond edit form. Flags and charts read the
+   same effective range, so they can never disagree. */
+function effRange(key, pond){
+  var p = waterParam(key); if (!p) return null;
+  var c = pond && pond.ranges ? pond.ranges[key] : null;
+  if (c && isFinite(Number(c.gLo)) && isFinite(Number(c.gHi)))
+    return {gLo:Number(c.gLo), gHi:Number(c.gHi), aLo:p.aLo, aHi:p.aHi, custom:true, unit:p.unit};
+  return {gLo:p.gLo, gHi:p.gHi, aLo:p.aLo, aHi:p.aHi, custom:false, unit:p.unit};
+}
+function waterFlag(key, v, pond){
   var p = waterParam(key); if (!p || v === '' || v === null || v === undefined || !isFinite(Number(v))) return null;
   v = Number(v);
-  if (v >= p.gLo && v <= p.gHi) return {cls:'ok', label:'In range'};
-  if ((p.aLo === null || v >= p.aLo) && (p.aHi === null || v <= p.aHi)) return {cls:'amberf', label:'Watch'};
+  var r = effRange(key, pond);
+  if (v >= r.gLo && v <= r.gHi) return {cls:'ok', label:'In range'};
+  if ((r.aLo === null || v >= r.aLo) && (r.aHi === null || v <= r.aHi)) return {cls:'amberf', label:'Watch'};
   return {cls:'redf', label:'Out of range'};
 }
-function waterRangeText(key){
+function waterRangeText(key, pond){
   var p = waterParam(key); if (!p) return '';
+  var r = effRange(key, pond);
+  if (r.custom) return 'Your range ' + r.gLo + '–' + r.gHi + (p.unit ? ' ' + p.unit : '') + ' for this pond';
   if (key === 'ammonia' || key === 'nitrite') return 'Aim for 0 ppm';
   if (key === 'dox') return 'Aim for 6 mg/L or more';
   if (key === 'salinity') return 'Most ponds run 0–0.1%';
@@ -266,11 +302,66 @@ function feedBandFor(tempF){
   return FEED_BANDS[FEED_BANDS.length-1];
 }
 
+/* Feeding-ration maths (common published rules of thumb — always shown
+   on screen next to the result, never hidden):
+   · Daily ration = total fish weight × a % of body weight per day,
+     and the % follows the same temperature bands as the feeding guide.
+   · Weight from length uses a length→weight curve: koi ≈ 0.00075 ×
+     inches³ (lb); a slimmer generic-fish curve ≈ 0.00045 × inches³.
+     A recorded weight always beats the curve. */
+var RATION_BANDS = [
+  {max:39.9, pct:0,   meals:0},
+  {max:50,   pct:0.5, meals:1},
+  {max:60,   pct:1,   meals:2},
+  {max:70,   pct:2,   meals:3},
+  {max:85,   pct:3,   meals:3},
+  {max:999,  pct:1,   meals:2}
+];
+function rationBandFor(tempF){
+  if (tempF === null || tempF === undefined || tempF === '' || !isFinite(Number(tempF))) return null;
+  var t = Number(tempF);
+  for (var i=0;i<RATION_BANDS.length;i++) if (t <= RATION_BANDS[i].max) return RATION_BANDS[i];
+  return RATION_BANDS[RATION_BANDS.length-1];
+}
+function estWeightLb(lenIn, curve){
+  var L = Number(lenIn)||0; if (!(L > 0)) return 0;
+  var k = curve === 'generic' ? 0.00045 : 0.00075;
+  return Math.round(L * L * L * k * 100) / 100;
+}
+function fishWeightLb(f, curve){
+  var g = latestGrowth(f.id);
+  if (g && g.weightLb !== '' && g.weightLb !== null && g.weightLb !== undefined && Number(g.weightLb) > 0)
+    return {lb:Number(g.weightLb), estimated:false};
+  if (g && Number(g.lenIn) > 0) return {lb:estWeightLb(g.lenIn, curve), estimated:true};
+  return {lb:0, estimated:false, unmeasured:true};
+}
+function pondRation(pid){
+  var p = pondById(pid); if (!p) return null;
+  var curve = p.rationCurve === 'generic' ? 'generic' : 'koi';
+  var fish = fishInPond(pid);
+  var totalLb = 0, estCount = 0, unmeasured = 0;
+  fish.forEach(function(f){
+    var w = fishWeightLb(f, curve);
+    totalLb += w.lb;
+    if (w.estimated) estCount++;
+    if (w.unmeasured) unmeasured++;
+  });
+  totalLb = Math.round(totalLb * 100) / 100;
+  var temp = latestTemp(pid);
+  var band = rationBandFor(temp);
+  var gramsPerDay = band ? Math.round(totalLb * 453.592 * band.pct / 100) : 0;
+  var fed = state.feedings.filter(function(x){ return x.pondId === pid && x.date === todayStr(); });
+  var fedG = 0;
+  fed.forEach(function(x){ fedG += (Number(x.amountLb)||0) * 453.592; });
+  return {fishCount:fish.length, totalLb:totalLb, estCount:estCount, unmeasured:unmeasured,
+    tempF:temp, band:band, gramsPerDay:gramsPerDay, fedGrams:Math.round(fedG), fedCount:fed.length, curve:curve};
+}
+
 /* ---------- state ---------- */
 function blankState(){
   return { v:1, farmName:'', setupDone:false, demo:false, seq:0,
     ponds:[], fish:[], moves:[], growth:[], spawns:[], batches:[], frycounts:[],
-    water:[], changes:[], filters:[], health:[], feedings:[], foodstock:[],
+    water:[], changes:[], filters:[], health:[], feedings:[], foodstock:[], tasks:[],
     sales:[], customers:[], waitlist:[], money:[], notes:[], shop:[] };
 }
 var state = blankState();
@@ -631,7 +722,7 @@ function needsAttention(){
       items.push({kind:'filter', pondId:p.id, text:'Filter maintenance due on ' + p.name + ' — last done ' + fmtDate(lf) + ' (' + daysBetween(lf, today) + ' days ago, every ' + fe + ').'});
     if (lt){
       WATER_PARAMS.forEach(function(wp){
-        var fl = waterFlag(wp.key, lt[wp.key]);
+        var fl = waterFlag(wp.key, lt[wp.key], p);
         if (fl && fl.cls === 'redf')
           items.push({kind:'water', pondId:p.id, text:p.name + ': ' + wp.label + ' was out of range on the last test (' + fmtDate(lt.date) + ') — retest soon.'});
       });
@@ -652,6 +743,12 @@ function needsAttention(){
     if ((Number(s.onHand)||0) <= (Number(s.lowAt)||0))
       items.push({kind:'food', text:'Food running low: ' + s.food + ' — ' + (Number(s.onHand)||0) + ' lb on hand.'});
   });
+  (state.tasks || []).forEach(function(t){
+    if (t.nextDue && t.nextDue < today)
+      items.push({kind:'task', taskId:t.id, text:'Care task overdue: ' + t.name + ' on ' + pondName(t.pondId) + ' — was due ' + fmtDate(t.nextDue) + ' (every ' + t.everyDays + ' days).'});
+    else if (t.nextDue === today)
+      items.push({kind:'task', taskId:t.id, text:'Care task due today: ' + t.name + ' on ' + pondName(t.pondId) + ' (every ' + t.everyDays + ' days).'});
+  });
   state.batches.forEach(function(b){
     var cs = batchCounts(b.id);
     var lastCount = cs.length ? cs[cs.length-1].date : b.hatchDate;
@@ -660,10 +757,41 @@ function needsAttention(){
   });
   return items;
 }
+function weekAgendaHTML(){
+  var today = todayStr(), end = addDaysStr(today, 6);
+  var rows = [];
+  function push(date, text, taskId){ if (date >= today && date <= end) rows.push({date:date, text:text, taskId:taskId || null}); }
+  (state.tasks || []).forEach(function(t){ if (t.nextDue) push(t.nextDue, '🗓 ' + t.name + ' — ' + pondName(t.pondId), t.id); });
+  state.ponds.forEach(function(p){
+    var lt = latestTest(p.id), every = Number(p.testEveryDays) || 7;
+    if (lt) push(addDaysStr(lt.date, every), '🧪 Water test due — ' + p.name);
+    var lf = lastFilterDate(p.id), fe = Number(p.filterEveryDays) || 30;
+    if (lf) push(addDaysStr(lf, fe), '🧹 Filter work due — ' + p.name);
+  });
+  state.health.forEach(function(hl){
+    if (hl.endDate) push(hl.endDate, '💊 Treatment ends — ' + fishLabel(fishById(hl.fishId)) + (hl.treatment ? ' (' + hl.treatment + ')' : ''));
+    if (hl.followUp) push(hl.followUp, '🩺 Follow-up check — ' + fishLabel(fishById(hl.fishId)));
+  });
+  state.batches.forEach(function(b){
+    if (batchCountNow(b) <= 0) return;
+    var cs = batchCounts(b.id);
+    var lastCount = cs.length ? cs[cs.length-1].date : b.hatchDate;
+    if (lastCount) push(addDaysStr(lastCount, 14), '🔢 Fry count check — ' + b.name);
+  });
+  rows.sort(function(a, b){ return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
+  var h = '<details class="card" style="margin-top:14px;"><summary style="font-weight:700; cursor:pointer;">🗓 This week — what\u2019s coming (' + rows.length + ')</summary>';
+  if (!rows.length) h += '<p class="empty" style="margin-top:8px;">Nothing due in the next 7 days. Quiet week at the pond.</p>';
+  rows.forEach(function(r){
+    h += '<p class="small" style="margin:7px 0;"><b>' + (r.date === today ? 'Today' : fmtDate(r.date)) + '</b> — ' + esc(r.text) +
+      (r.taskId ? ' <button type="button" class="btn small" data-act="task-done" data-id="' + r.taskId + '">✓ Done</button>' : '') + '</p>';
+  });
+  h += '<p class="small mut">KoiBook can\u2019t ring from inside a closed file — use “Add to phone calendar (.ics)” on any pond\u2019s care schedule and your phone\u2019s own calendar does the reminding.</p></details>';
+  return h;
+}
 function howItWorksHTML(){
   return '<h3>How this page works</h3><div class="card"><p class="small" style="margin-top:0;">Today is your morning round in one screen. <b>Needs attention</b> pulls together anything overdue or out of line — water tests, filter cleaning, treatments ending, fish sitting in quarantine, food running low, fry counts gone stale — all computed from your own records, so if it is not listed here, it is not due.</p>' +
   '<p class="small">The four cards count your live fish, your ponds, what is marked for sale, and this month\u2019s sales. Everything on this page comes from the same single set of records as every other page — change a fish anywhere and it changes here too.</p>' +
-  '<p class="small" style="margin-bottom:0;">New here? Fish holds every koi with its photos, growth record and full pond-to-pond journey. Ponds holds feeding and food stock. Breeding holds spawns and fry batches. Water holds tests, water changes and filter work.</p></div>';
+  '<p class="small" style="margin-bottom:0;">New here? Fish holds every fish with its photos, growth record and full pond-to-pond journey. Ponds holds feeding and food stock. Breeding holds spawns and fry batches. Water holds tests, water changes and filter work.</p></div>';
 }
 
 /* ---------- Today ---------- */
@@ -671,7 +799,7 @@ function viewToday(){
   var h = '<h2 class="view-title">' + esc(state.farmName || 'Today') + '</h2>';
   if (!state.setupDone && state.fish.length === 0 && !state.demo){
     h += '<div class="card"><h3 style="margin-top:0;">👋 Welcome to KoiBook</h3>' +
-      '<p>The keeper, breeder and seller\u2019s notebook for koi: every fish with its photo, growth record and full journey between ponds; spawns and fry batches with pedigrees; water tests with the safe ranges built in; and sales that post to Money once — never twice. Everything stays on this device — no account, no internet needed.</p>' +
+      '<p>The keeper, breeder and seller\u2019s notebook for koi — and for goldfish, other pond fish and aquarium fish too: every fish with its photo, growth record and full journey between ponds; spawns and fry batches with pedigrees; water tests with the safe ranges built in; and sales that post to Money once — never twice. Everything stays on this device — no account, no internet needed.</p>' +
       '<label for="setupName">Your pond or business name (optional)</label>' +
       '<input type="text" id="setupName" placeholder="e.g. Maple Bend Koi">' +
       '<div class="row" style="margin-top:12px;"><div><button type="button" class="btn" data-act="setup-start">Start blank</button></div>' +
@@ -697,10 +825,12 @@ function viewToday(){
     '</div>';
   h += '<div class="row">' +
     '<div><button type="button" class="btn" data-act="fish-add">➕ Add a fish</button></div>' +
+    '<div><button type="button" class="btn ghost" data-act="fish-batch">🗂️ Add a batch</button></div>' +
     '<div><button type="button" class="btn" data-act="water-add">🧪 Log a water test</button></div>' +
     '<div><button type="button" class="btn ghost" data-act="sale">🧺 Log a sale</button></div>' +
     '<div><button type="button" class="btn ghost" data-act="goto-money">💵 Money</button></div>' +
     '<div><button type="button" class="btn ghost" data-act="goto-supplies">🛒 Supplies guide</button></div></div>';
+  h += weekAgendaHTML();
   h += howItWorksHTML();
   return h;
 }
@@ -730,6 +860,7 @@ function fishCard(f){
 function viewFish(){
   var h = '<h2 class="view-title">🐟 Fish</h2>';
   h += '<div class="row" style="margin-bottom:12px;"><div><button type="button" class="btn" data-act="fish-add">➕ Add a fish</button></div>' +
+    '<div><button type="button" class="btn ghost" data-act="fish-batch">🗂️ Add a batch</button></div>' +
     '<div><button type="button" class="btn ghost" data-act="goto-ponds">🌊 Ponds</button></div></div>';
   var filters = [['all','All'],['pond','In a pond'],['sale','For sale'],['quarantine','Quarantine'],['sold','Sold'],['deceased','Deceased']];
   h += '<div class="sup-chips" style="margin-bottom:10px;">' + filters.map(function(x){
@@ -786,6 +917,7 @@ function viewFishDetail(fid){
     (f.status !== 'sold' && f.status !== 'deceased' ? '<button type="button" data-act="fish-move" data-id="' + f.id + '">🔁 Move fish</button>' : '') +
     '<button type="button" data-act="fish-health" data-id="' + f.id + '">🩺 Log health</button>' +
     '<button type="button" data-act="fish-edit" data-id="' + f.id + '">Edit</button>' +
+    '<button type="button" data-act="fish-passport" data-id="' + f.id + '">🖨 Passport</button>' +
     (f.status !== 'sold' && f.status !== 'deceased' ? '<button type="button" class="warn" data-act="fish-sell" data-id="' + f.id + '">Sell this fish</button>' +
     '<button type="button" class="warn" data-act="fish-die" data-id="' + f.id + '">Record death</button>' : '') +
     '<button type="button" data-act="fish-del" data-id="' + f.id + '">Delete</button></div></div>';
@@ -823,8 +955,18 @@ function viewFishDetail(fid){
   }
   h += '</div>';
 
-  /* growth */
+  /* then & now (photo compare) */
   var gs = fishGrowth(f.id), gst = growthStats(f.id);
+  var photoGs = gs.filter(function(g){ return g.photo; });
+  if (f.photo && photoGs.length){
+    var then = photoGs[0];
+    h += '<h3>📷 Then &amp; now</h3><div class="card"><div class="row">' +
+      '<div style="text-align:center;"><img class="fish-photo" src="' + then.photo + '" alt="Earlier measurement photo"><br><span class="small mut">Then — ' + fmtDate(then.date) + ' · ' + fmtLen(then.lenIn) + '</span></div>' +
+      '<div style="text-align:center;"><img class="fish-photo" src="' + f.photo + '" alt="Current photo"><br><span class="small mut">Now — latest photo · ' + (gst ? fmtLen(gst.lenIn) : '') + '</span></div>' +
+      '</div></div>';
+  }
+
+  /* growth */
   h += '<h3>📈 Growth record</h3><div class="card">';
   if (gst){
     h += '<p class="small" style="margin-top:0;">Now <b>' + fmtLen(gst.lenIn) + '</b>' +
@@ -878,7 +1020,7 @@ function viewPonds(){
       '<span class="small">' + (p.gallons ? Number(p.gallons).toLocaleString() + ' gal' + (p.liters ? ' · ' + Number(p.liters).toLocaleString() + ' L' : '') : 'size not set') +
       (p.filterType ? ' · ' + esc(p.filterType) : '') + '<br>' +
       '<b>' + fish.length + ' fish</b> living here now' +
-      (gpi ? ' · about ' + gpi.perInch + ' gal per inch of fish' + (gpi.perInch < 10 ? ' — <span style="color:var(--red); font-weight:700;">tight</span> (a common rule of thumb is 10+ gal/inch for grown koi)' : '') : '') +
+      (gpi ? ' · about ' + gpi.perInch + ' gal per inch of fish' + (gpi.perInch < 10 ? ' — <span style="color:var(--red); font-weight:700;">tight</span> (a common rule of thumb is 10+ gal/inch for large pond fish)' : '') : '') +
       '<br>Last water test: ' + (lt ? fmtDate(lt.date) : 'never') + '</span>' +
       '<div class="tray-actions"><button type="button" class="primary" data-act="pond-open" data-id="' + p.id + '">Open pond</button>' +
       '<button type="button" data-act="water-add-for" data-id="' + p.id + '">🧪 Test water</button>' +
@@ -886,7 +1028,7 @@ function viewPonds(){
   });
   h += feedingsCardHTML();
   h += foodStockCardHTML();
-  h += '<h3>🍽 Feeding guide — by water temperature</h3><div class="card"><p class="small mut" style="margin-top:0;">General koi-keeping guidance — your fish and your filter always have the last word. Amount eaten in about 5 minutes is the classic measure; scoop out the rest.</p><table>' +
+  h += '<h3>🍽 Feeding guide — by water temperature</h3><div class="card"><p class="small mut" style="margin-top:0;">General fish-keeping guidance — your fish and your filter always have the last word. Amount eaten in about 5 minutes is the classic measure; scoop out the rest.</p><table>' +
     '<tr><th>Water</th><th>What to do</th></tr>' +
     FEED_BANDS.map(function(b){ return '<tr><td style="white-space:nowrap;"><b>' + esc(b.band) + '</b></td><td>' + esc(b.text) + '</td></tr>'; }).join('') +
     '</table></div>';
@@ -926,6 +1068,162 @@ function foodStockCardHTML(){
   h += '<button type="button" class="btn small ghost" data-act="food-add" style="margin-top:10px;">➕ Add / update food</button></div>';
   return h;
 }
+/* ---------- Pond page extras: trend chart · ration · calculators · care schedule ---------- */
+var trendParamByPond = {};
+function trendReadings(pid, key){
+  return pondTests(pid).slice().reverse().filter(function(w){
+    return w[key] !== '' && w[key] !== null && w[key] !== undefined && isFinite(Number(w[key]));
+  }).map(function(w){ return {date:w.date, v:Number(w[key])}; });
+}
+function waterTrendSVG(pid, key, pond){
+  var rs = trendReadings(pid, key);
+  if (rs.length < 2) return '';
+  var r = effRange(key, pond), wp = waterParam(key);
+  var W = 320, H = 130, padL = 34, padR = 10, padT = 12, padB = 22;
+  var t0 = parseDate(rs[0].date).getTime(), t1 = parseDate(rs[rs.length-1].date).getTime();
+  if (t1 <= t0) t1 = t0 + 86400000;
+  var vals = rs.map(function(x){ return x.v; });
+  var lo = Math.min.apply(null, vals.concat([r.gLo])), hi = Math.max.apply(null, vals.concat([r.gHi]));
+  if (hi - lo < 0.001){ lo -= 0.5; hi += 0.5; }
+  var pad = (hi - lo) * 0.12; lo -= pad; hi += pad;
+  function X(d){ return padL + (parseDate(d).getTime() - t0) / (t1 - t0) * (W - padL - padR); }
+  function Y(v){ return padT + (hi - v) / (hi - lo) * (H - padT - padB); }
+  var s = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" role="img" aria-label="' + esc(wp.label) + ' trend chart" style="background:#fbfdfd; border:1px solid var(--line); border-radius:9px;">';
+  var bTop = Math.max(padT, Y(Math.min(r.gHi, hi))), bBot = Math.min(H - padB, Y(Math.max(r.gLo, lo)));
+  if (bBot > bTop) s += '<rect x="' + padL + '" y="' + bTop.toFixed(1) + '" width="' + (W - padL - padR) + '" height="' + (bBot - bTop).toFixed(1) + '" fill="#0e6e6e" opacity="0.10"/>';
+  s += '<line x1="' + padL + '" y1="' + Y(lo + pad) + '" x2="' + (W - padR) + '" y2="' + Y(lo + pad) + '" stroke="#d5e2e2"/>' +
+       '<line x1="' + padL + '" y1="' + Y(hi - pad) + '" x2="' + (W - padR) + '" y2="' + Y(hi - pad) + '" stroke="#d5e2e2"/>' +
+       '<text x="2" y="' + (Y(hi - pad) + 4) + '" font-size="10" fill="#65787c">' + (Math.round((hi - pad) * 100) / 100) + '</text>' +
+       '<text x="2" y="' + (Y(lo + pad) + 4) + '" font-size="10" fill="#65787c">' + (Math.round((lo + pad) * 100) / 100) + '</text>';
+  s += '<polyline points="' + rs.map(function(x){ return X(x.date).toFixed(1) + ',' + Y(x.v).toFixed(1); }).join(' ') + '" fill="none" stroke="#0e6e6e" stroke-width="2.5"/>';
+  rs.forEach(function(x){
+    var fl = waterFlag(key, x.v, pond);
+    var col = fl && fl.cls === 'redf' ? '#b23a2e' : fl && fl.cls === 'amberf' ? '#d98a06' : '#e86a2a';
+    s += '<circle cx="' + X(x.date).toFixed(1) + '" cy="' + Y(x.v).toFixed(1) + '" r="3.5" fill="' + col + '"/>';
+  });
+  s += '<text x="' + padL + '" y="' + (H - 6) + '" font-size="10" fill="#65787c">' + fmtDate(rs[0].date) + '</text>' +
+       '<text x="' + (W - padR - 52) + '" y="' + (H - 6) + '" font-size="10" fill="#65787c">' + fmtDate(rs[rs.length-1].date) + '</text></svg>';
+  return s;
+}
+function waterTrendHTML(p){
+  var pid = p.id;
+  var withData = WATER_PARAMS.filter(function(wp){ return trendReadings(pid, wp.key).length > 0; });
+  var key = trendParamByPond[pid];
+  if (!key || !withData.some(function(wp){ return wp.key === key; })){
+    key = withData.length ? withData.slice().sort(function(a, b){ return trendReadings(pid, b.key).length - trendReadings(pid, a.key).length; })[0].key : 'ph';
+    trendParamByPond[pid] = key;
+  }
+  var wp = waterParam(key);
+  var rs = trendReadings(pid, key);
+  var h = '<h3>📈 Water trends</h3><div class="card">';
+  if (!withData.length){ h += '<p class="empty">No readings yet — log water tests and the trends draw themselves here.</p></div>'; return h; }
+  h += '<div class="sup-chips">' + withData.map(function(x){
+    return '<button type="button" class="sup-chip' + (x.key === key ? ' active' : '') + '" data-act="trend-param" data-id="' + pid + '|' + x.key + '">' + esc(x.label) + '</button>';
+  }).join('') + '</div>';
+  if (rs.length < 2){
+    h += '<p class="empty">Two or more tests draw the trend — ' + esc(wp.label) + ' has ' + rs.length + ' so far.</p>';
+  } else {
+    var last = rs[rs.length - 1], prev = rs[rs.length - 2];
+    var diff = Math.round((last.v - prev.v) * 1000) / 1000;
+    var arrow = diff > 0 ? '↑ trending up' : diff < 0 ? '↓ trending down' : '→ steady';
+    h += waterTrendSVG(pid, key, p);
+    h += '<p class="small" style="margin:8px 0 0;"><b>' + esc(wp.label) + ': ' + last.v + (wp.unit ? ' ' + wp.unit : '') + '</b> — ' + arrow + ' over the last ' + rs.length + ' tests · ' + esc(waterRangeText(key, p)) + '. The shaded band is the good range; orange dots are “watch”, red are out of range.</p>';
+  }
+  h += '</div>';
+  return h;
+}
+function rationCardHTML(p){
+  var r = pondRation(p.id);
+  var h = '<h3>🍽 Today\u2019s ration</h3><div class="card">';
+  if (!r || !r.fishCount) h += '<p class="empty">No fish living here to feed.</p>';
+  else if (r.tempF === null) h += '<p class="small" style="margin:0;">Log a water test with a temperature and this card works out today\u2019s ration for the ' + r.fishCount + ' fish living here.</p>';
+  else if (!r.band || r.band.pct === 0) h += '<p class="small" style="margin:0;">Water is ' + fmtTemp(r.tempF) + ' — below 40°F the guide says <b>do not feed</b>. Digestion has stopped; uneaten food only fouls the water.</p>';
+  else {
+    var perMeal = r.band.meals > 0 ? Math.round(r.gramsPerDay / r.band.meals) : r.gramsPerDay;
+    h += '<p class="small" style="margin-top:0;">Fish here weigh about <b>' + r.totalLb + ' lb</b> in total' +
+      (r.estCount ? ' (' + r.estCount + ' estimated from length — marked ≈)' : '') +
+      (r.unmeasured ? ' · ' + r.unmeasured + ' never measured, so not counted' : '') + '. At ' + fmtTemp(r.tempF) + ' the guide feeds <b>' + r.band.pct + '% of body weight a day</b>:</p>' +
+      '<p style="margin:6px 0;"><b>' + r.gramsPerDay + ' g</b> (' + (Math.round(r.gramsPerDay / 28.35 * 10) / 10) + ' oz) a day' +
+      (r.band.meals > 1 ? ' — about <b>' + perMeal + ' g per feeding</b>, ' + r.band.meals + ' feedings' : '') + '.</p>' +
+      (r.fedCount ? '<p class="small">Fed so far today: <b>' + r.fedGrams + ' g</b> of the ' + r.gramsPerDay + ' g.</p>' : '<p class="small mut">Nothing logged as fed today yet.</p>') +
+      '<p class="small mut">How: weight × ' + r.band.pct + '%. Weight comes from each fish\u2019s last recorded weight, or estimated from length (' + (r.curve === 'generic' ? 'generic fish curve ≈ 0.00045 × inches³' : 'koi curve ≈ 0.00075 × inches³') + ', in lb) — an estimate is a starting point; what the fish actually finish in about 5 minutes has the last word.</p>' +
+      '<div class="sup-chips"><button type="button" class="sup-chip' + (r.curve === 'koi' ? ' active' : '') + '" data-act="ration-curve" data-id="' + p.id + '|koi">Koi curve</button>' +
+      '<button type="button" class="sup-chip' + (r.curve === 'generic' ? ' active' : '') + '" data-act="ration-curve" data-id="' + p.id + '|generic">Generic fish curve</button></div>' +
+      '<button type="button" class="btn small" data-act="feed-ration" data-id="' + p.id + '">🍽 Use this ration — log a feeding</button>';
+  }
+  h += '</div>';
+  return h;
+}
+function calculatorsCardHTML(p){
+  return '<h3>🧮 Pond calculators</h3><div class="card">' +
+    '<p class="small mut" style="margin-top:0;">Salt, medication doses and KH — worked out from this pond\u2019s volume and latest test, with the maths shown. Always check the product label; these are calculators, not veterinary advice.</p>' +
+    '<div class="tray-actions"><button type="button" data-act="calc-salt" data-id="' + p.id + '">🧂 Salt</button>' +
+    '<button type="button" data-act="calc-med" data-id="' + p.id + '">💊 Medication dose</button>' +
+    '<button type="button" data-act="calc-kh" data-id="' + p.id + '">⚖️ KH adjustment</button></div></div>';
+}
+/* ---------- Care schedules (recurring tasks) ---------- */
+function taskById(id){ for (var i=0;i<(state.tasks||[]).length;i++) if (state.tasks[i].id===id) return state.tasks[i]; return null; }
+function pondTasks(pid){ return (state.tasks || []).filter(function(t){ return t.pondId === pid; }).slice().sort(function(a, b){ return a.nextDue < b.nextDue ? -1 : 1; }); }
+function careCardHTML(p){
+  var ts = pondTasks(p.id);
+  var today = todayStr();
+  var h = '<h3>🗓 Care schedule</h3><div class="card">';
+  if (!ts.length) h += '<p class="empty">No repeating tasks for this pond yet. Add the rounds you always mean to do — water tests, filter cleans, feeding changes — every N days, your N.</p>';
+  ts.forEach(function(t){
+    var overdue = t.nextDue < today, dueToday = t.nextDue === today;
+    h += '<div style="border-bottom:1px solid var(--line); padding:7px 0;"><b>' + esc(t.name) + '</b> ' +
+      (overdue ? '<span class="pill redf">Overdue</span>' : dueToday ? '<span class="pill amberf">Due today</span>' : '') +
+      '<br><span class="small">Every ' + t.everyDays + ' days' + (t.timeNote ? ' · ' + esc(t.timeNote) : '') + ' · next due <b>' + fmtDate(t.nextDue) + '</b>' +
+      (t.lastDone ? ' · last done ' + fmtDate(t.lastDone) : '') + '</span>' +
+      '<div class="tray-actions"><button type="button" class="primary" data-act="task-done" data-id="' + t.id + '">✓ Done</button>' +
+      '<button type="button" data-act="task-snooze" data-id="' + t.id + '">Snooze 1 day</button>' +
+      '<button type="button" data-act="task-del" data-id="' + t.id + '">Delete</button></div></div>';
+  });
+  h += '<div class="tray-actions"><button type="button" class="btn small" data-act="task-add" data-id="' + p.id + '">➕ Add a repeating task</button>' +
+    '<button type="button" class="btn small ghost" data-act="ics-export">📅 Add to phone calendar (.ics)</button></div></div>';
+  return h;
+}
+function openTaskSheet(pondId){
+  var p = pondById(pondId); if (!p) return;
+  var body = '<p class="small" style="margin-top:0;">A repeating job for <b>' + esc(p.name) + '</b>. The interval is yours — every N days, any N.</p>' +
+    '<label for="f-t-name">Task</label><input type="text" id="f-t-name" placeholder="e.g. Backwash the bead filter">' +
+    '<div class="row"><div><label for="f-t-every">Every (days)</label><input type="number" id="f-t-every" inputmode="numeric" min="1" step="1" value="7"></div>' +
+    '<div><label for="f-t-first">First due</label><input type="date" id="f-t-first" value="' + todayStr() + '"></div></div>' +
+    '<label for="f-t-time">Time of day / note (optional)</label><input type="text" id="f-t-time" placeholder="e.g. morning round">';
+  openSheet('Add a repeating task — ' + p.name, body, [
+    {label:'Cancel', cls:'ghost', onClick:closeSheet},
+    {label:'➕ Add task', cls:'amber', onClick:function(){
+      var nm = val('f-t-name').trim();
+      if (!nm){ toast('Name the task.', true); return; }
+      var every = Math.max(1, Math.floor(num(val('f-t-every'), 7)));
+      state.tasks.push({id:uid('tk'), pondId:pondId, name:nm, everyDays:every, timeNote:val('f-t-time').trim(), nextDue:val('f-t-first') || todayStr(), lastDone:''});
+      save(); closeSheet(); savedToast(nm); render();
+    }}
+  ]);
+}
+function exportICS(){
+  var tasks = state.tasks || [];
+  if (!tasks.length){ toast('No care tasks yet — add one on a pond page first.', true); return; }
+  function icsDate(s){ return String(s || '').replace(/-/g, ''); }
+  var lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//KoiBook//Care Schedule//EN'];
+  tasks.forEach(function(t){
+    lines.push('BEGIN:VEVENT');
+    lines.push('UID:' + t.id + '@koibook');
+    lines.push('DTSTART;VALUE=DATE:' + icsDate(t.nextDue));
+    lines.push('RRULE:FREQ=DAILY;INTERVAL=' + Math.max(1, Math.floor(Number(t.everyDays) || 7)));
+    lines.push('SUMMARY:' + String(t.name).replace(/[,;]/g, ' ') + ' — ' + pondName(t.pondId));
+    lines.push('END:VEVENT');
+  });
+  lines.push('END:VCALENDAR');
+  var blob = new Blob([lines.join('\r\n')], {type:'text/calendar'});
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'koibook-care-schedule.ics';
+  document.body.appendChild(a); a.click();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 400);
+  toast('Calendar file downloaded ✓ — open it on your phone to add the reminders.');
+}
+
 function viewPondDetail(pid){
   var p = pondById(pid); if (!p) return viewPonds();
   var h = '<p><button type="button" class="btn ghost small" data-act="pond-back">← All ponds</button></p>';
@@ -955,11 +1253,14 @@ function viewPondDetail(pid){
       visitors.map(function(f){ return esc(fishLabel(f)); }).join(' · ') +
       '<br><span class="mut">Open any fish to see its full journey.</span></p></div>';
   }
+  h += rationCardHTML(p);
+  h += calculatorsCardHTML(p);
   var tests = pondTests(pid).slice(0, 5);
   h += '<h3>🧪 Latest water tests</h3><div class="card">';
   if (!tests.length) h += '<p class="empty">No tests logged for this pond yet.</p>';
   tests.forEach(function(w){ h += waterTestHTML(w); });
   h += '</div>';
+  h += waterTrendHTML(p);
   var chs = state.changes.filter(function(c){ return c.pondId === pid; }).sort(function(a, b){ return a.date < b.date ? 1 : -1; }).slice(0, 5);
   var fls = pondFilters(pid).slice(0, 5);
   h += '<h3>💧 Water changes &amp; filter work</h3><div class="card">';
@@ -967,15 +1268,16 @@ function viewPondDetail(pid){
   chs.forEach(function(c){ h += '<p class="small" style="margin:4px 0;">💧 <b>' + fmtDate(c.date) + '</b> — ' + esc(c.pct) + '% water change' + (c.note ? ' · ' + esc(c.note) : '') + ' <button type="button" class="del" data-act="change-del" data-id="' + c.id + '" aria-label="Delete water change">🗑</button></p>'; });
   fls.forEach(function(x){ h += '<p class="small" style="margin:4px 0;">🧹 <b>' + fmtDate(x.date) + '</b> — ' + esc(x.task) + (x.note ? ' · ' + esc(x.note) : '') + ' <button type="button" class="del" data-act="filter-del" data-id="' + x.id + '" aria-label="Delete filter entry">🗑</button></p>'; });
   h += '</div>';
+  h += careCardHTML(p);
   return h;
 }
 function waterTestHTML(w){
   var cells = WATER_PARAMS.map(function(wp){
     var v = w[wp.key];
     if (v === '' || v === null || v === undefined) return '';
-    var fl = waterFlag(wp.key, v);
+    var fl = waterFlag(wp.key, v, pondById(w.pondId));
     var shown = wp.key === 'tempF' ? fmtTemp(v) : (v + (wp.unit ? ' ' + wp.unit : ''));
-    return '<tr><td>' + wp.label + '</td><td>' + shown + '</td><td>' + (fl ? '<span class="pill ' + fl.cls + '">' + fl.label + '</span>' : '') + '<br><span class="small mut">' + esc(waterRangeText(wp.key)) + '</span></td></tr>';
+    return '<tr><td>' + wp.label + '</td><td>' + shown + '</td><td>' + (fl ? '<span class="pill ' + fl.cls + '">' + fl.label + '</span>' : '') + '<br><span class="small mut">' + esc(waterRangeText(wp.key, pondById(w.pondId))) + '</span></td></tr>';
   }).join('');
   return '<div style="border-bottom:1px solid var(--line); padding:8px 0;"><b>' + fmtDate(w.date) + '</b> · ' + esc(pondName(w.pondId)) +
     ' <button type="button" class="del" data-act="water-del" data-id="' + w.id + '" aria-label="Delete water test">🗑</button>' +
@@ -991,7 +1293,7 @@ function viewWater(){
     '<div><button type="button" class="btn ghost" data-act="filter-add">🧹 Filter work</button></div></div>';
   h += '<div class="card"><h3 style="margin-top:0;">The ranges KoiBook watches</h3><p class="small" style="margin:0;">' +
     WATER_PARAMS.map(function(wp){ return '<b>' + wp.label + ':</b> ' + esc(waterRangeText(wp.key)); }).join(' · ') +
-    '<br><span class="mut">General published koi-keeping guidance. Any ammonia or nitrite reading at all means water changes and no feeding until it clears — your test kit and your fish outrank any table.</span></p></div>';
+    '<br><span class="mut">General published fish-keeping guidance. Any ammonia or nitrite reading at all means water changes and no feeding until it clears — your test kit and your fish outrank any table.</span></p></div>';
   if (!state.ponds.length) h += '<div class="card empty">Add a pond first (Ponds tab) — tests are logged per pond.</div>';
   state.ponds.forEach(function(p){
     var tests = pondTests(p.id).slice(0, 3);
@@ -1105,7 +1407,8 @@ function viewSales(){
         : fishLabel(fishById(s.fishId)) + (fishById(s.fishId) ? ' — ' + fishById(s.fishId).variety : '');
       h += '<tr><td>' + fmtDate(s.date) + '</td><td>' + esc(what) + (s.note ? '<br><span class="small mut">' + esc(s.note) + '</span>' : '') + '</td>' +
         '<td>' + esc(customerName(s.customerId)) + '</td><td class="num">' + money(s.price) + '</td>' +
-        '<td class="num"><button type="button" class="del" data-act="sale-edit" data-id="' + s.id + '" aria-label="Edit sale">✏️</button>' +
+        '<td class="num">' + (s.kind === 'fish' ? '<button type="button" class="del" data-act="sale-print" data-id="' + s.id + '" aria-label="Print sale certificate">🖨</button>' : '') +
+        '<button type="button" class="del" data-act="sale-edit" data-id="' + s.id + '" aria-label="Edit sale">✏️</button>' +
         '<button type="button" class="del" data-act="sale-del" data-id="' + s.id + '" aria-label="Delete sale">🗑</button></td></tr>';
     });
     h += '</table>';
@@ -1365,6 +1668,7 @@ function viewMore(){
     '<p class="small">Everything lives on this device — fish, photos, pedigrees, all of it. Export a backup before switching phones or browsers, and import it on the new one. Photos are stored compressed on this device; big collections deserve regular backups.</p>' +
     '<div class="row"><div><button type="button" class="btn ghost" data-act="export">⬇ Export backup</button></div>' +
     '<div><button type="button" class="btn ghost" data-act="import">⬆ Import backup</button></div></div>' +
+    '<p style="margin-top:10px;"><button type="button" class="btn ghost small" data-act="export-csv">⬇ Water tests as CSV (spreadsheet)</button></p>' +
     (state.demo ? '<p style="margin-top:12px;"><button type="button" class="btn danger small" data-act="clear-demo">Clear sample data &amp; start fresh</button></p>' : '') +
     '<p style="margin-top:8px;"><button type="button" class="btn ghost small" data-act="reset-all">Erase everything</button></p></div>';
   h += '<h3>About &amp; Legal</h3><div class="card">' +
@@ -1375,11 +1679,17 @@ function viewMore(){
 }
 function helpHTML(){
   var items = [
-    ['Add a fish (and its photo)', 'Fish → “Add a fish”. Give it a name and its variety, pick where it lives, and its first size — that first size starts its growth record. Add a photo from your camera or files; KoiBook shrinks it on the spot so your storage lasts. Fish you bred can be linked to their sire and dam right in the form, which builds the pedigree automatically.'],
+    ['Add a fish (and its photo)', 'Fish → “Add a fish”. Give it a name and its species / variety, pick where it lives, and its first size — that first size starts its growth record. Add a photo from your camera or files; KoiBook shrinks it on the spot so your storage lasts. Fish you bred can be linked to their sire and dam right in the form, which builds the pedigree automatically.'],
+    ['Not just koi', 'KoiBook keeps the full 20-variety koi library — and goldfish, other pond fish and freshwater aquarium fish get exactly the same records. The species picker is grouped (Koi varieties / Goldfish & pond fish / Aquarium fish), and “Other — type it in…” lets you record any fish at all, by its own name.'],
+    ['Add a batch — dozens or hundreds at once', 'Fish → “Add a batch”. One shared form — species, pond, source, size, cost each — plus how many, up to 9,999 in one go. Every fish becomes its own full record (photo slot, growth chart, journey, sales), named automatically like “Kohaku 2026 #1”, “#2”, so nothing ever collides. Batches of 25+ ask you to confirm first, and a batch saves all at once or not at all. After saving, “Add another variety” keeps the pond and source filled in, so a whole shipment goes in in a few passes.'],
+    ['Pond calculators (salt · dose · KH)', 'Each pond page has three calculators, prefilled from the pond\u2019s volume and latest water test: salt (how much to add to reach a target %, or how much water to change to come down), medication dose (from the rate on your product\u2019s own label — and one tap files it as a treatment on a fish\u2019s health log), and KH adjustment (grams of bicarbonate, with the rule of thumb printed). Every result shows its maths in plain words and ends with the same reminder: check the product label — this is arithmetic, not veterinary advice.'],
+    ['Water trends & today\u2019s ration', 'Under a pond\u2019s latest tests, the trend chart draws any parameter\u2019s history with the safe range shaded in — orange points are “watch”, red are out of range. The ration card adds up the pond\u2019s fish (recorded weights, or estimated from length with the curve named on the card), reads the latest temperature, and gives today\u2019s food in grams with a per-feeding split; “Use this ration” pre-fills the feeding log. You can set your own safe ranges per pond on the pond\u2019s edit form.'],
+    ['Care schedules & the week ahead', 'On any pond, “Add a repeating task” — water test, filter clean, anything — every N days, your N. Due and overdue tasks surface on Today and in Needs Attention, with Done and Snooze. Today\u2019s “This week” list gathers tasks, tests, treatments ending and fry counts coming due. One honest limit: KoiBook can\u2019t ring from inside a closed file — export the tasks once with “Add to phone calendar (.ics)” on the pond\u2019s schedule and your phone\u2019s calendar does the ringing.'],
+    ['Print a fish passport / sale certificate', 'Open any fish and tap “Passport”: a clean print view with its photo, species, pedigree, size history, full journey and health summary — the paperwork a buyer, insurer or show desk wants. On a completed fish sale in Sales, the 🖨 button prints the same document as a sale certificate with buyer, date and price.'],
     ['Trace a fish between ponds', 'Every fish always knows where it lives, because its home is read from its journey — never typed twice. Tap “Move fish” on any fish, pick the pond it is going to and why, and the move is added to its timeline in the same save. Open the fish any time to see every pond it has ever lived in, in order. A pond\u2019s page shows who lives there now and who passed through.'],
     ['Record growth', 'Open a fish and tap “Measure” — or “Measure” right on its card. Enter the length (weight too if you weigh), and add a dated photo in the bowl if you took one. KoiBook works out the gain since last time and the per-month rate, and draws the growth chart on the fish\u2019s page. Inches are stored; centimetres are shown alongside.'],
     ['Breed & raise fry', 'Breeding → “Record a spawn”: pick the dam and up to two sires from your fish, note the egg and hatch estimates, and a fry batch is created, linked to both parents. Log counts as the fry grow, record culls with the reason, and watch the survival percentage. When fry are big enough to tell apart, “Graduate” turns any number of them into full fish records — each one already carrying its pedigree.'],
-    ['Test the water', 'Water → “Log a water test”, or Tell. Each reading is checked against the usual koi ranges and flagged right on the page — ammonia and nitrite should read zero; KH is watched because it is your pH-crash insurance. Set each pond\u2019s test interval on its edit form and Today reminds you when a test is overdue.'],
+    ['Test the water', 'Water → “Log a water test”, or Tell. Each reading is checked against the usual safe ranges and flagged right on the page — ammonia and nitrite should read zero; KH is watched because it is your pH-crash insurance. Set each pond\u2019s test interval on its edit form and Today reminds you when a test is overdue.'],
     ['Sell a fish or fry', 'Sales → “Log a sale” — or open the fish and tap “Sell this fish”. Pick the buyer (or add them on the spot), enter the price once, and three things happen in the same save: the money posts to Money (once, never twice), the fish is marked sold, and its journey gets its final move — “Sold”. Fry go the same way: pick the batch, the count comes off the batch, and the money posts once. Deleting a sale undoes all of it cleanly.'],
     ['Tell ' + APP_NAME, 'Tap the Tell button and say it plainly: “pond one pH 7.4 ammonia zero temperature 68”, “Ember is now 22 inches”, “move Goldie to quarantine”, “sold Coral to Jordan Ellis for $450”, “spent $40 on koi food”. Tell listens in one press, shows you exactly what it heard, and only saves when you tap Save. Anything it cannot file is kept word-for-word in More → Tell notes. Tell runs on this device — it is not a cloud AI.'],
     ['Finding supplies', 'The Supplies guide (the button on Today, or Supplies in More) has the full checklist: test kits, food by season, meds &amp; treatments, nets &amp; bowls, pumps &amp; filters, quarantine setup and buying fish — what each thing is for, what to look for, and where keepers buy it at good prices. Tick items off as you get them; your ticks save on this device and sync between tabs like everything else. Supplier names and sites were checked on the date shown on each entry. Prices change often, so the guide links to each supplier instead of promising a price — always confirm the price on the supplier\u2019s own site before you buy.'],
@@ -1400,11 +1710,11 @@ function legalTextHTML(){
   return '<h2>Legal — Terms, Disclaimer &amp; Privacy</h2>' +
   '<p><b>' + APP_NAME + ' v' + APP_VERSION + '</b> · Terms version ' + TERMS_VERSION + '<br>Sold by ' + SELLER_NAME + ' — ' + SELLER_EMAIL + '</p>' +
   '<h3>Terms of Use</h3>' +
-  '<p>By using ' + APP_NAME + ' you agree to these terms. The app is provided for record-keeping and planning for your own koi keeping, breeding and selling. You get a license to use it on your own devices; you may not resell, redistribute, or reverse-engineer it except where the law says you can.</p>' +
+  '<p>By using ' + APP_NAME + ' you agree to these terms. The app is provided for record-keeping and planning for your own fish keeping, breeding and selling — koi, other pond fish and aquarium fish alike. You get a license to use it on your own devices; you may not resell, redistribute, or reverse-engineer it except where the law says you can.</p>' +
   '<p>All records you enter are stored only on your device, in your browser\u2019s local storage. There is no account and no server copy. If you clear your browser data, switch devices without importing a backup, or your browser removes site data, records can be lost — exporting backups from More is your responsibility. Photos are stored compressed on your device; very large photo collections can fill the storage your browser allows, and the app will tell you plainly if a photo cannot be kept.</p>' +
   '<p>The app is provided \u201cas is\u201d, without warranties of any kind. To the maximum extent the law allows, ' + SELLER_NAME + '\u2019s total liability for anything connected with the app is limited to the amount you paid for it.</p>' +
   '<h3>Disclaimer</h3>' +
-  '<p>Water ranges, feeding bands, stocking hints and treatment notes in this app are general published koi-keeping guidance, offered as planning aids. They are not veterinary advice, and they never outrank your own test kit, your own eyes, or a qualified aquatic veterinarian. Fish health decisions — diagnosis, medication, dosing — are yours, and medication labels and local rules for selling live animals differ by place and change: checking and following them is your responsibility.</p>' +
+  '<p>Water ranges, feeding bands, stocking hints and treatment notes in this app are general published fish-keeping guidance, offered as planning aids. They are not veterinary advice, and they never outrank your own test kit, your own eyes, or a qualified aquatic veterinarian. Fish health decisions — diagnosis, medication, dosing — are yours, and medication labels and local rules for selling live animals differ by place and change: checking and following them is your responsibility.</p>' +
   '<p>Money totals are simple arithmetic on the numbers you enter. They are not accounting, tax, or legal advice.</p>' +
   '<p>Voice entry (\u201cTell\u201d) is a pattern matcher that runs on your device. It is not a cloud AI. Always read the confirmation card before saving — you are responsible for checking the app\u2019s outputs before relying on them.</p>' +
   '<h3>Privacy</h3>' +
@@ -1518,7 +1828,36 @@ function fishOptions(selectedId, onlyActive){
   return h;
 }
 function varietyOptions(selected){
-  return VARIETIES.map(function(v){ return '<option value="' + esc(v) + '"' + (v === selected ? ' selected' : '') + '>' + esc(v) + '</option>'; }).join('');
+  var h = '';
+  SPECIES_GROUPS.forEach(function(g){
+    h += '<optgroup label="' + esc(g.label) + '">' + g.items.map(function(v){
+      return '<option value="' + esc(v) + '"' + (v === selected ? ' selected' : '') + '>' + esc(v) + '</option>';
+    }).join('') + '</optgroup>';
+  });
+  h += '<option value="' + CUSTOM_VARIETY + '"' + (selected && !isLibraryVariety(selected) ? ' selected' : '') + '>Other — type it in…</option>';
+  return h;
+}
+/* Free-text species entry paired with a variety <select>: shown only
+   when "Other — type it in…" is picked. resolveVariety returns the
+   final string, or null when custom was picked but left blank. */
+function varietyCustomHTML(selectId, selected){
+  var isCust = !!(selected && !isLibraryVariety(selected));
+  return '<div id="' + selectId + '-cwrap" style="display:' + (isCust ? 'block' : 'none') + ';">' +
+    '<label for="' + selectId + '-custom">Type the species / variety</label>' +
+    '<input type="text" id="' + selectId + '-custom" value="' + (isCust ? esc(selected) : '') + '" placeholder="e.g. Blue Dolphin Cichlid, Golden Tench cross…"></div>';
+}
+function wireVarietyCustom(selectId){
+  var sel = document.getElementById(selectId), wrap = document.getElementById(selectId + '-cwrap');
+  if (!sel || !wrap) return;
+  sel.addEventListener('change', function(){ wrap.style.display = sel.value === CUSTOM_VARIETY ? 'block' : 'none'; });
+}
+function resolveVariety(selectId){
+  var v = val(selectId);
+  if (v === CUSTOM_VARIETY){
+    var c = val(selectId + '-custom').trim();
+    return c || null;
+  }
+  return v;
 }
 function photoFieldHTML(prefix, existing){
   return '<label>Photo</label>' +
@@ -1561,11 +1900,12 @@ function openFishSheet(editId){
   var g = isNew ? null : latestGrowth(f.id);
   var body =
     '<label for="f-name">Name</label><input type="text" id="f-name" value="' + esc(f.name) + '" placeholder="e.g. Ember">' +
-    '<div class="row"><div><label for="f-variety">Variety</label><select id="f-variety">' + varietyOptions(f.variety) + '</select></div>' +
+    '<div class="row"><div><label for="f-variety">Species / variety</label><select id="f-variety">' + varietyOptions(f.variety) + '</select></div>' +
     '<div><label for="f-sex">Sex</label><select id="f-sex">' +
       '<option value="U"' + (f.sex === 'U' ? ' selected' : '') + '>Unknown</option>' +
       '<option value="F"' + (f.sex === 'F' ? ' selected' : '') + '>Female</option>' +
       '<option value="M"' + (f.sex === 'M' ? ' selected' : '') + '>Male</option></select></div></div>' +
+    varietyCustomHTML('f-variety', f.variety) +
     '<label for="f-pattern">Pattern / colour notes</label><input type="text" id="f-pattern" value="' + esc(f.pattern) + '" placeholder="e.g. two-step hi, clean shiroji">' +
     '<label style="display:flex; gap:10px; align-items:center; font-size:15px; color:var(--ink); font-weight:400;"><input type="checkbox" id="f-butterfly"' + (f.butterfly ? ' checked' : '') + '> 🦋 Butterfly / longfin</label>' +
     '<div class="row"><div><label for="f-born">Born / hatched (year)</label><input type="text" id="f-born" inputmode="numeric" value="' + esc(f.bornYear) + '" placeholder="e.g. 2023"></div>' +
@@ -1585,12 +1925,14 @@ function openFishSheet(editId){
   openSheet(isNew ? 'Add a fish' : 'Edit ' + (f.name || f.code), body, [
     {label:'Cancel', cls:'ghost', onClick:closeSheet},
     {label: isNew ? '➕ Add fish' : '✓ Save', cls:'amber', onClick:function(){ submitFishForm(editId, curPond); }}
-  ], function(){ wirePhotoField('f-photo-file', 'f-photo-data', 'f-photo-preview'); wirePhotoRemove('f-photo'); });
+  ], function(){ wirePhotoField('f-photo-file', 'f-photo-data', 'f-photo-preview'); wirePhotoRemove('f-photo'); wireVarietyCustom('f-variety'); });
 }
 function submitFishForm(editId, prevPondId){
   var name = val('f-name').trim();
   var pondId = val('f-pond');
   if (!pondId){ toast('Add a pond first (Ponds tab) — every fish needs a home.', true); return; }
+  var variety = resolveVariety('f-variety');
+  if (variety === null){ toast('Type the species / variety, or pick one from the list.', true); return; }
   var rec, isNew = !editId;
   if (isNew){
     state.seq = (state.seq || 0) + 1;
@@ -1598,7 +1940,7 @@ function submitFishForm(editId, prevPondId){
     state.fish.push(rec);
   } else rec = fishById(editId);
   if (!rec){ toast('That fish is gone.', true); return; }
-  rec.name = name; rec.variety = val('f-variety'); rec.pattern = val('f-pattern').trim();
+  rec.name = name; rec.variety = variety; rec.pattern = val('f-pattern').trim();
   rec.sex = val('f-sex'); rec.butterfly = document.getElementById('f-butterfly').checked;
   rec.bornYear = val('f-born').trim(); rec.source = val('f-source');
   rec.breeder = val('f-breeder').trim();
@@ -1625,6 +1967,292 @@ function submitFishForm(editId, prevPondId){
   render();
 }
 
+/* ---------- Bulk add: many fish, one form ----------
+   addFishBatch is the only batch writer. It builds every record from
+   the shared fields, gives each fish its own unique code (K-<seq>) and
+   a collision-proof auto-name "<label> #n", writes each fish's first
+   move (and first measurement, if a size was given), then saves ONCE.
+   If the save fails, the in-memory additions roll back — a batch is
+   never half-added. Every fish it creates is a full individual record:
+   photo slot, growth, moves, health and sales all work on it exactly
+   like a single-added fish. */
+function batchNameStart(base){
+  var start = 1, pre = base + ' #';
+  state.fish.forEach(function(f){
+    if (f.name && f.name.indexOf(pre) === 0){
+      var n = parseInt(f.name.slice(pre.length), 10);
+      if (isFinite(n) && n >= start) start = n + 1;
+    }
+  });
+  return start;
+}
+function addFishBatch(p){
+  var qty = Math.floor(Number(p.qty) || 0);
+  if (!(qty > 0) || !p.pondId || !p.variety) return null;
+  var base = (p.label || '').trim() || p.variety;
+  var date = p.date || todayStr();
+  var taken = {};
+  state.fish.forEach(function(f){ if (f.name) taken[f.name] = true; });
+  var k = batchNameStart(base);
+  var fLen = state.fish.length, mLen = state.moves.length, gLen = state.growth.length;
+  var created = [];
+  for (var i = 0; i < qty; i++){
+    var nm = base + ' #' + k;
+    while (taken[nm]){ k++; nm = base + ' #' + k; }
+    taken[nm] = true; k++;
+    state.seq = (state.seq || 0) + 1;
+    var rec = {id:uid('f'), code:'K-' + state.seq, name:nm, variety:p.variety,
+      pattern:p.pattern || '', sex:p.sex || 'U', butterfly:!!p.butterfly,
+      bornYear:p.bornYear || '', source:p.source || 'bought', breeder:p.breeder || '',
+      sireId:null, damId:null, sireName:'', damName:'',
+      cost:(p.cost === '' || p.cost === null || p.cost === undefined) ? '' : round2(p.cost),
+      forSale:false, askPrice:'', photo:'', notes:p.notes || '', status:'active', batchId:null};
+    state.fish.push(rec);
+    moveFish(rec.id, p.pondId, date, 'First placement', p.moveNote || 'Added as a batch');
+    if (p.size > 0) state.growth.push({id:uid('g'), fishId:rec.id, date:date, lenIn:p.size, weightLb:'', photo:'', note:'First measurement'});
+    created.push(rec);
+  }
+  if (!save()){
+    state.fish.length = fLen; state.moves.length = mLen; state.growth.length = gLen;
+    return null;
+  }
+  return created;
+}
+var batchPrefill = null;
+function openBatchFishSheet(prefill){
+  if (!state.ponds.length){ toast('Add a pond first (Ponds tab) — every fish needs a home.', true); return; }
+  var pf = prefill || batchPrefill || {};
+  var selVariety = pf.variety || 'Kohaku';
+  var body =
+    '<p class="small" style="margin-top:0;">One form, a whole shipment or spawn selection. Every fish becomes its <b>own full record</b> — its own photo slot, growth chart, journey and sale history — named automatically: <b>' + esc((pf.label || '').trim() || selVariety) + ' #1, #2, …</b></p>' +
+    '<div class="row"><div><label for="f-bf-qty">How many fish</label><input type="number" id="f-bf-qty" inputmode="numeric" min="1" max="9999" step="1" value="' + (pf.qty || '') + '" placeholder="e.g. 120"></div>' +
+    '<div><label for="f-bf-date">Date added</label><input type="date" id="f-bf-date" value="' + (pf.date || todayStr()) + '"></div></div>' +
+    '<label for="f-bf-variety">Species / variety</label><select id="f-bf-variety">' + varietyOptions(selVariety) + '</select>' +
+    varietyCustomHTML('f-bf-variety', selVariety) +
+    '<label for="f-bf-label">Name them as (optional)</label><input type="text" id="f-bf-label" value="' + esc(pf.label || '') + '" placeholder="e.g. Kohaku 2026 — fish become “Kohaku 2026 #1”, “#2”…">' +
+    '<div class="row"><div><label for="f-bf-sex">Sex</label><select id="f-bf-sex">' +
+      '<option value="U"' + (pf.sex !== 'F' && pf.sex !== 'M' ? ' selected' : '') + '>Unknown / mixed</option>' +
+      '<option value="F"' + (pf.sex === 'F' ? ' selected' : '') + '>Female</option>' +
+      '<option value="M"' + (pf.sex === 'M' ? ' selected' : '') + '>Male</option></select></div>' +
+    '<div><label for="f-bf-born">Born / hatched (year)</label><input type="text" id="f-bf-born" inputmode="numeric" value="' + esc(pf.bornYear || '') + '" placeholder="e.g. 2026"></div></div>' +
+    '<label for="f-bf-pattern">Pattern / colour notes (shared)</label><input type="text" id="f-bf-pattern" value="' + esc(pf.pattern || '') + '" placeholder="e.g. mixed patterns, some tancho">' +
+    '<label style="display:flex; gap:10px; align-items:center; font-size:15px; color:var(--ink); font-weight:400;"><input type="checkbox" id="f-bf-butterfly"' + (pf.butterfly ? ' checked' : '') + '> 🦋 Butterfly / longfin</label>' +
+    '<label for="f-bf-source">Where did they come from?</label><select id="f-bf-source">' +
+      '<option value="bought"' + (pf.source !== 'bred' ? ' selected' : '') + '>Bought in</option>' +
+      '<option value="bred"' + (pf.source === 'bred' ? ' selected' : '') + '>Bred here</option></select>' +
+    '<label for="f-bf-breeder">Breeder / seller (if bought)</label><input type="text" id="f-bf-breeder" value="' + esc(pf.breeder || '') + '" placeholder="e.g. a breeder two counties over">' +
+    '<div class="row"><div><label for="f-bf-cost">Cost per fish ($, optional)</label><input type="number" id="f-bf-cost" inputmode="decimal" min="0" step="0.01" value="' + (pf.cost === '' || pf.cost === null || pf.cost === undefined ? '' : pf.cost) + '"></div>' +
+    '<div><label for="f-bf-size">Size now (inches, optional)</label><input type="number" id="f-bf-size" inputmode="decimal" min="0" step="0.01" value="' + (pf.size ? pf.size : '') + '"></div></div>' +
+    '<label for="f-bf-pond">They will live in</label><select id="f-bf-pond">' + pondOptions(pf.pondId || (state.ponds.length ? state.ponds[0].id : ''), false) + '</select>' +
+    '<label for="f-bf-notes">Notes (shared)</label><textarea id="f-bf-notes" placeholder="Shipment, spawn or selection notes…">' + esc(pf.notes || '') + '</textarea>' +
+    '<p class="small" id="f-bf-summary" style="margin-bottom:0;"></p>';
+  openSheet('Add a batch of fish', body, [
+    {label:'Cancel', cls:'ghost', onClick:closeSheet},
+    {label:'➕ Add batch', cls:'amber', onClick:function(){ submitBatchFishForm(); }}
+  ], function(){
+    wireVarietyCustom('f-bf-variety');
+    var upd = function(){
+      var q = Math.floor(num(val('f-bf-qty'), 0));
+      var v = resolveVariety('f-bf-variety') || 'fish';
+      var base = val('f-bf-label').trim() || v;
+      var el = document.getElementById('f-bf-summary');
+      if (el) el.textContent = q > 0
+        ? 'Will add ' + q + ' ' + v + ' to ' + pondName(val('f-bf-pond')) + ', named “' + base + ' #' + batchNameStart(base) + '” … “' + base + ' #' + (batchNameStart(base) + q - 1) + '”.'
+        : 'Enter how many — up to 9,999 in one go.';
+    };
+    ['f-bf-qty','f-bf-label','f-bf-pond','f-bf-variety','f-bf-variety-custom'].forEach(function(id){
+      var el = document.getElementById(id);
+      if (el){ el.addEventListener('input', upd); el.addEventListener('change', upd); }
+    });
+    upd();
+  });
+}
+function readBatchForm(){
+  var variety = resolveVariety('f-bf-variety');
+  if (variety === null){ toast('Type the species / variety, or pick one from the list.', true); return null; }
+  var qty = Math.floor(num(val('f-bf-qty'), 0));
+  if (!(qty >= 1) || qty > 9999){ toast('Enter how many fish — 1 to 9,999 in one batch.', true); return null; }
+  var pondId = val('f-bf-pond');
+  if (!pondId){ toast('Pick where they will live.', true); return null; }
+  return {qty:qty, variety:variety, label:val('f-bf-label').trim(), sex:val('f-bf-sex'),
+    bornYear:val('f-bf-born').trim(), pattern:val('f-bf-pattern').trim(),
+    butterfly:document.getElementById('f-bf-butterfly').checked,
+    source:val('f-bf-source'), breeder:val('f-bf-breeder').trim(),
+    cost:val('f-bf-cost') === '' ? '' : round2(val('f-bf-cost')),
+    size:num(val('f-bf-size'), 0), pondId:pondId, date:val('f-bf-date') || todayStr(),
+    notes:val('f-bf-notes').trim(), moveNote:'Added as a batch'};
+}
+function submitBatchFishForm(){
+  var p = readBatchForm(); if (!p) return;
+  if (p.qty >= 25){
+    var base = p.label || p.variety, s = batchNameStart(base);
+    openSheet('Add ' + p.qty + ' fish?', '<p>Add <b>' + p.qty + ' ' + esc(p.variety) + '</b> to <b>' + esc(pondName(p.pondId)) + '</b>?</p>' +
+      '<p class="small">They will be named “' + esc(base) + ' #' + s + '” through “' + esc(base) + ' #' + (s + p.qty - 1) + '” — each one its own full record with photo slot, growth chart and journey. The whole batch saves at once, or not at all.</p>', [
+      {label:'← Back', cls:'ghost', onClick:function(){ openBatchFishSheet(p); }},
+      {label:'✓ Yes — add ' + p.qty + ' fish', cls:'amber', onClick:function(){ finishBatchAdd(p); }}
+    ]);
+    return;
+  }
+  finishBatchAdd(p);
+}
+function finishBatchAdd(p){
+  var created = addFishBatch(p);
+  if (!created){ toast('The batch was not added — storage may be full. Export a backup (More) and try again.', true); return; }
+  batchPrefill = {pondId:p.pondId, source:p.source, breeder:p.breeder, date:p.date};
+  currentTab = 'fish'; detailFishId = null;
+  openSheet('✓ Batch added', '<p><b>' + created.length + ' ' + esc(p.variety) + '</b> added to <b>' + esc(pondName(p.pondId)) + '</b> — “' + esc(created[0].name) + '” through “' + esc(created[created.length - 1].name) + '”.</p>' +
+    '<p class="small">Each one is a full record: open any of them to add its photo, measurements, moves and sales. Got another variety in the same shipment? Add it next — pond and source are already filled in.</p>', [
+    {label:'Done', cls:'ghost', onClick:function(){ closeSheet(); savedToast(created.length + ' fish added'); render(); }},
+    {label:'🗂️ Add another variety', cls:'amber', onClick:function(){ openBatchFishSheet(batchPrefill); }}
+  ]);
+  render();
+}
+
+/* ---------- Pond calculators (salt · medication dose · KH) ----------
+   Deterministic arithmetic only. Every result prints its formula and
+   constants in plain words and carries the label-check line — these
+   are calculators, not veterinary advice. Inputs prefill from the
+   pond's stored volume and its latest water test. */
+function calcSalt(gal, curPct, tgtPct){
+  gal = Number(gal)||0; curPct = Number(curPct)||0; tgtPct = Number(tgtPct)||0;
+  if (!(gal > 0)) return null;
+  var delta = Math.round((tgtPct - curPct) * 1000) / 1000;
+  if (delta > 0){
+    var lb = gal * delta * 0.0835; /* 8.35 lb per 1,000 gal per 0.1% */
+    return {dir:'up', delta:delta, lb:Math.round(lb * 10) / 10, kg:Math.round(lb * 0.4536 * 10) / 10};
+  }
+  if (delta < 0){
+    var frac = curPct > 0 ? 1 - tgtPct / curPct : 0;
+    return {dir:'down', delta:delta, replacePct:Math.round(frac * 100), replaceGal:Math.round(gal * frac)};
+  }
+  return {dir:'same', delta:0};
+}
+function calcMedDose(gal, rate, basis){
+  gal = Number(gal)||0; rate = Number(rate)||0;
+  if (!(gal > 0) || !(rate > 0)) return null;
+  var total = basis === 'per1000L' ? rate * (gal * 3.785) / 1000 : rate * gal / 100;
+  return Math.round(total * 10) / 10;
+}
+function calcKH(gal, curPpm, tgtPpm){
+  gal = Number(gal)||0;
+  if (!(gal > 0)) return null;
+  var dPpm = Math.round(((Number(tgtPpm)||0) - (Number(curPpm)||0)) * 10) / 10;
+  if (dPpm === 0) return {dir:'same', dPpm:0};
+  if (dPpm < 0) return {dir:'down', dPpm:dPpm};
+  var dKH = dPpm / 17.9; /* 1 dKH ≈ 17.9 ppm */
+  var grams = (gal * 3.785) / 1000 * dKH * 30; /* ≈30 g bicarb per 1,000 L per 1 dKH */
+  return {dir:'up', dPpm:dPpm, dKH:Math.round(dKH * 10) / 10, grams:Math.round(grams)};
+}
+var CALC_LABEL_LINE = 'Check the product label before you dose — this is arithmetic from the numbers you typed, not veterinary advice.';
+function latestReading(pid, key){
+  var lt = latestTest(pid);
+  return lt && lt[key] !== '' && lt[key] !== null && lt[key] !== undefined ? Number(lt[key]) : '';
+}
+function openSaltSheet(pid){
+  var p = pondById(pid); if (!p) return;
+  var body = '<p class="small" style="margin-top:0;">For <b>' + esc(p.name) + '</b>. Pond salt only leaves by water changes — this works out both directions.</p>' +
+    '<label for="f-cs-gal">Pond volume (US gallons)</label><input type="number" id="f-cs-gal" inputmode="decimal" min="0" step="1" value="' + (p.gallons || '') + '">' +
+    '<div class="row"><div><label for="f-cs-cur">Current salinity (%)</label><input type="number" id="f-cs-cur" inputmode="decimal" min="0" step="0.01" value="' + latestReading(pid, 'salinity') + '"></div>' +
+    '<div><label for="f-cs-tgt">Target salinity (%)</label><input type="number" id="f-cs-tgt" inputmode="decimal" min="0" step="0.01" value="0.3"></div></div>' +
+    '<div class="sup-chips">' + [0.1, 0.3, 0.5].map(function(x){ return '<button type="button" class="sup-chip" data-tgt="' + x + '">' + x.toFixed(1) + '%</button>'; }).join('') + '</div>' +
+    '<p class="small mut">Prefilled from the pond record and its latest water test — change anything that has moved on.</p>';
+  openSheet('🧂 Salt calculator — ' + p.name, body, [
+    {label:'Cancel', cls:'ghost', onClick:closeSheet},
+    {label:'Calculate', cls:'amber', onClick:function(){
+      var gal = num(val('f-cs-gal'), 0), cur = num(val('f-cs-cur'), 0), tgt = num(val('f-cs-tgt'), 0);
+      var r = calcSalt(gal, cur, tgt);
+      if (!r){ toast('Enter the pond volume first.', true); return; }
+      var html;
+      if (r.dir === 'up') html = '<p>Add <b>' + r.lb + ' lb</b> (' + r.kg + ' kg) of pond salt to take ' + esc(p.name) + ' from ' + cur + '% to ' + tgt + '%.</p>' +
+        '<p class="small">How: ' + gal.toLocaleString() + ' gal × ' + r.delta + '% × 0.0835 lb per gallon per 1% — the standard 8.35 lb per 1,000 gallons for each 0.1%. Dissolve it in a bucket of pond water first and add it in 2–3 stages a few hours apart, then retest — never dump dry salt on the fish.</p>';
+      else if (r.dir === 'down') html = '<p>Salt does not evaporate or filter out — to come <b>down</b> from ' + cur + '% to ' + tgt + '% you dilute it: replace about <b>' + r.replacePct + '% of the water</b> (≈' + r.replaceGal.toLocaleString() + ' gal) with unsalted water, in stages.</p>' +
+        '<p class="small">How: the share to replace is 1 − (target ÷ current) = 1 − (' + tgt + ' ÷ ' + cur + '). Big single changes stress fish and filters — do it over several days.</p>';
+      else html = '<p>Current and target match (' + cur + '%) — no salt to add, no water to change.</p>';
+      html += '<p class="small mut">' + CALC_LABEL_LINE + '</p>';
+      openSheet('🧂 Salt — result', html, [{label:'Done', cls:'amber', onClick:closeSheet}]);
+    }}
+  ], function(){
+    var chips = document.querySelectorAll('#sheetBody [data-tgt]');
+    chips.forEach(function(ch){ ch.addEventListener('click', function(){
+      var inp = document.getElementById('f-cs-tgt'); if (inp) inp.value = ch.getAttribute('data-tgt');
+    }); });
+  });
+}
+var calcReturnFish = null;
+function openMedSheet(pid){
+  var p = pondById(pid); if (!p) return;
+  var body = '<p class="small" style="margin-top:0;">Works out a whole-pond dose from the rate printed on <b>your product\u2019s label</b>, for <b>' + esc(p.name) + '</b>.</p>' +
+    '<label for="f-cm-name">Product name</label><input type="text" id="f-cm-name" placeholder="e.g. the treatment you are using">' +
+    '<label for="f-cm-gal">Pond volume (US gallons)</label><input type="number" id="f-cm-gal" inputmode="decimal" min="0" step="1" value="' + (p.gallons || '') + '">' +
+    '<div class="row"><div><label for="f-cm-rate">Label dose rate</label><input type="number" id="f-cm-rate" inputmode="decimal" min="0" step="any" placeholder="e.g. 10"></div>' +
+    '<div><label for="f-cm-basis">Rate is per</label><select id="f-cm-basis"><option value="per100gal">100 US gallons</option><option value="per1000L">1,000 litres</option></select></div>' +
+    '<div><label for="f-cm-unit">Dose measured in</label><input type="text" id="f-cm-unit" value="ml"></div></div>' +
+    '<p class="small mut">' + CALC_LABEL_LINE + '</p>';
+  openSheet('💊 Medication dose — ' + p.name, body, [
+    {label:'Cancel', cls:'ghost', onClick:function(){ calcReturnFish = null; closeSheet(); }},
+    {label:'Calculate', cls:'amber', onClick:function(){
+      var gal = num(val('f-cm-gal'), 0), rate = num(val('f-cm-rate'), 0), basis = val('f-cm-basis'), unit = val('f-cm-unit').trim() || 'ml';
+      var product = val('f-cm-name').trim();
+      var dose = calcMedDose(gal, rate, basis);
+      if (dose === null){ toast('Enter the pond volume and the label dose rate.', true); return; }
+      var doseText = dose + ' ' + unit + ' for ' + gal.toLocaleString() + ' gal (label rate ' + rate + ' ' + unit + ' per ' + (basis === 'per1000L' ? '1,000 L' : '100 gal') + ')';
+      var html = '<p>Dose for ' + esc(p.name) + ': <b>' + esc(doseText) + '</b>.</p>' +
+        '<p class="small">How: ' + (basis === 'per1000L' ? gal.toLocaleString() + ' gal ≈ ' + Math.round(gal * 3.785).toLocaleString() + ' L, so ' + rate + ' × ' + Math.round(gal * 3.785).toLocaleString() + ' ÷ 1,000' : rate + ' × ' + gal.toLocaleString() + ' ÷ 100') + ' = ' + dose + ' ' + esc(unit) + '. Measure it, do not eyeball it — and never exceed the label rate.</p>' +
+        '<p class="small mut">' + CALC_LABEL_LINE + '</p>';
+      var bar = [{label:'Done', cls:'ghost', onClick:function(){ calcReturnFish = null; closeSheet(); }}];
+      var fishHere = fishInPond(pid);
+      if (calcReturnFish || fishHere.length){
+        bar.push({label:'🩺 File as a treatment', cls:'amber', onClick:function(){
+          openMedFileSheet(pid, product || 'Pond treatment', doseText);
+        }});
+      }
+      openSheet('💊 Dose — result', html, bar);
+    }}
+  ]);
+}
+function openMedFileSheet(pid, product, doseText){
+  var fishHere = fishInPond(pid);
+  var preset = calcReturnFish && fishById(calcReturnFish) ? calcReturnFish : (fishHere.length ? fishHere[0].id : '');
+  if (!preset){ toast('No fish live in that pond to file the treatment against.', true); calcReturnFish = null; return; }
+  var body = '<p class="small" style="margin-top:0;">Files this dose on a fish\u2019s health log — the pond gets treated, the record lives with the fish being treated.</p>' +
+    '<label for="f-cmf-fish">Fish treated</label><select id="f-cmf-fish">' + fishHere.map(function(f){ return '<option value="' + f.id + '"' + (f.id === preset ? ' selected' : '') + '>' + esc(fishLabel(f)) + ' — ' + esc(f.variety) + '</option>'; }).join('') + '</select>' +
+    '<label for="f-cmf-date">Date</label><input type="date" id="f-cmf-date" value="' + todayStr() + '">' +
+    '<p class="small">Treatment: <b>' + esc(product) + '</b><br>Dose: <b>' + esc(doseText) + '</b></p>';
+  openSheet('File treatment', body, [
+    {label:'Cancel', cls:'ghost', onClick:function(){ calcReturnFish = null; closeSheet(); }},
+    {label:'✓ File it', cls:'amber', onClick:function(){
+      state.health.push({id:uid('hl'), fishId:val('f-cmf-fish'), type:'entry', date:val('f-cmf-date') || todayStr(),
+        symptoms:'Pond treatment — dose worked out with the pond calculator', diagnosis:'', treatment:product, dose:doseText,
+        endDate:'', followUp:'', note:'Whole-pond dose for ' + pondName(pid)});
+      calcReturnFish = null;
+      save(); closeSheet(); savedToast('treatment filed'); render();
+    }}
+  ]);
+}
+function openKHSheet(pid){
+  var p = pondById(pid); if (!p) return;
+  var cur = latestReading(pid, 'kh');
+  var body = '<p class="small" style="margin-top:0;">Raises KH (alkalinity) with sodium bicarbonate — baking soda — for <b>' + esc(p.name) + '</b>. KH is your pH-crash insurance; raise it slowly.</p>' +
+    '<label for="f-ck-gal">Pond volume (US gallons)</label><input type="number" id="f-ck-gal" inputmode="decimal" min="0" step="1" value="' + (p.gallons || '') + '">' +
+    '<div class="row"><div><label for="f-ck-cur">Current KH (ppm)</label><input type="number" id="f-ck-cur" inputmode="decimal" min="0" step="1" value="' + cur + '"></div>' +
+    '<div><label for="f-ck-tgt">Target KH (ppm)</label><input type="number" id="f-ck-tgt" inputmode="decimal" min="0" step="1" value="' + (cur === '' ? 120 : Math.max(Number(cur) + 20, 120)) + '"></div></div>' +
+    '<p class="small mut">KoiBook records KH in ppm (the good band is 70–200 ppm ≈ 4–11 dKH). Prefilled from the latest test.</p>';
+  openSheet('⚖️ KH adjustment — ' + p.name, body, [
+    {label:'Cancel', cls:'ghost', onClick:closeSheet},
+    {label:'Calculate', cls:'amber', onClick:function(){
+      var gal = num(val('f-ck-gal'), 0);
+      var r = calcKH(gal, num(val('f-ck-cur'), 0), num(val('f-ck-tgt'), 0));
+      if (!r){ toast('Enter the pond volume first.', true); return; }
+      var html;
+      if (r.dir === 'up') html = '<p>Add about <b>' + r.grams + ' g</b> of sodium bicarbonate (≈' + Math.round(r.grams / 28.35 * 10) / 10 + ' oz), dissolved in a bucket of pond water.</p>' +
+        '<p class="small">How: raising KH by ' + r.dPpm + ' ppm is ' + r.dKH + ' dKH (1 dKH ≈ 17.9 ppm), and the common rule of thumb is ≈30 g of bicarb per 1,000 L per 1 dKH — ' + Math.round(gal * 3.785).toLocaleString() + ' L × ' + r.dKH + ' × 30 g. Add half today and half tomorrow, then retest: KH is a buffer, and a slow rise is a safe rise.</p>';
+      else if (r.dir === 'down') html = '<p>Bicarb only raises KH — there is nothing to add. To come down from ' + val('f-ck-cur') + ' ppm, dilute with ordinary water changes and let the pond use it up.</p>';
+      else html = '<p>Current and target match — nothing to add.</p>';
+      html += '<p class="small mut">' + CALC_LABEL_LINE.replace('product label', 'product label — and your test kit') + '</p>';
+      openSheet('⚖️ KH — result', html, [{label:'Done', cls:'amber', onClick:closeSheet}]);
+    }}
+  ]);
+}
 /* ---------- Move form (traceability) ---------- */
 function openMoveSheet(fishId){
   var f = fishById(fishId); if (!f) return;
@@ -1682,7 +2310,14 @@ function openPondSheet(editId){
     '<div><label for="f-pd-filter">Filter type</label><input type="text" id="f-pd-filter" value="' + esc(p.filterType) + '" placeholder="e.g. bead filter + shower"></div></div>' +
     '<div class="row"><div><label for="f-pd-test">Test water every (days)</label><input type="number" id="f-pd-test" inputmode="numeric" min="1" step="1" value="' + (Number(p.testEveryDays)||7) + '"></div>' +
     '<div><label for="f-pd-fe">Filter work every (days)</label><input type="number" id="f-pd-fe" inputmode="numeric" min="1" step="1" value="' + (Number(p.filterEveryDays)||30) + '"></div></div>' +
-    '<label for="f-pd-notes">Notes</label><textarea id="f-pd-notes" placeholder="Liner, depth, shade, anything…">' + esc(p.notes) + '</textarea>';
+    '<label for="f-pd-notes">Notes</label><textarea id="f-pd-notes" placeholder="Liner, depth, shade, anything…">' + esc(p.notes) + '</textarea>' +
+    '<details><summary style="font-weight:700; cursor:pointer; padding:6px 0;">⚙️ My own safe ranges for this pond (optional)</summary>' +
+    '<p class="small mut">Leave blank to use the standard ranges. Fill in a low and a high to make this pond\u2019s flags and trend charts use yours instead — handy for a hospital tank run salty, or a soft-water setup.</p>' +
+    WATER_PARAMS.map(function(wp){
+      var c = p.ranges && p.ranges[wp.key] ? p.ranges[wp.key] : null;
+      return '<div class="row"><div><label for="f-pd-r-' + wp.key + '-lo">' + wp.label + ' low</label><input type="number" id="f-pd-r-' + wp.key + '-lo" inputmode="decimal" step="any" value="' + (c ? c.gLo : '') + '" placeholder="' + wp.gLo + '"></div>' +
+      '<div><label for="f-pd-r-' + wp.key + '-hi">' + wp.label + ' high</label><input type="number" id="f-pd-r-' + wp.key + '-hi" inputmode="decimal" step="any" value="' + (c ? c.gHi : '') + '" placeholder="' + wp.gHi + '"></div></div>';
+    }).join('') + '</details>';
   openSheet(isNew ? 'Add a pond / tank' : 'Edit ' + p.name, body, [
     {label:'Cancel', cls:'ghost', onClick:closeSheet},
     {label: isNew ? '➕ Add pond' : '✓ Save', cls:'amber', onClick:function(){
@@ -1696,6 +2331,17 @@ function openPondSheet(editId){
       rec.testEveryDays = Math.max(1, num(val('f-pd-test'), 7));
       rec.filterEveryDays = Math.max(1, num(val('f-pd-fe'), 30));
       rec.notes = val('f-pd-notes').trim();
+      var ranges = {};
+      var badRange = '';
+      WATER_PARAMS.forEach(function(wp){
+        var lo = val('f-pd-r-' + wp.key + '-lo'), hi = val('f-pd-r-' + wp.key + '-hi');
+        if (lo !== '' && hi !== ''){
+          if (num(lo, 0) > num(hi, 0)) badRange = wp.label;
+          else ranges[wp.key] = {gLo:num(lo, 0), gHi:num(hi, 0)};
+        }
+      });
+      if (badRange){ toast(badRange + ': the low end must be below the high end.', true); return; }
+      rec.ranges = ranges;
       if (isNew) state.ponds.push(rec);
       save(); closeSheet(); savedToast(nm); render();
     }}
@@ -1714,7 +2360,7 @@ function openWaterSheet(presetPondId){
     '<label for="f-w-date">Date</label><input type="date" id="f-w-date" value="' + todayStr() + '">' +
     '<div class="row" style="flex-wrap:wrap;">' + fields + '</div>' +
     '<label for="f-w-note">Note</label><input type="text" id="f-w-note" placeholder="e.g. after a big water change">' +
-    '<p class="small mut">Leave blank anything you did not test — blanks are never guessed at. Readings are flagged against the usual koi ranges on the Water page.</p>';
+    '<p class="small mut">Leave blank anything you did not test — blanks are never guessed at. Readings are flagged against the usual safe ranges on the Water page.</p>';
   openSheet('Log a water test', body, [
     {label:'Cancel', cls:'ghost', onClick:closeSheet},
     {label:'✓ Save test', cls:'amber', onClick:function(){
@@ -1769,6 +2415,7 @@ function openHealthSheet(fishId){
     '<label for="f-h-diagnosis">Diagnosis (if known)</label><input type="text" id="f-h-diagnosis" placeholder="e.g. fungus">' +
     '<div class="row"><div><label for="f-h-treatment">Treatment</label><input type="text" id="f-h-treatment" placeholder="e.g. salt bath + topical iodine"></div>' +
     '<div><label for="f-h-dose">Medication &amp; dose</label><input type="text" id="f-h-dose" placeholder="e.g. pond salt to 0.3%"></div></div>' +
+    '<p style="margin:4px 0 0;"><button type="button" class="btn ghost small" id="f-h-calc">🧮 Work out a pond dose with the calculator</button></p>' +
     '<div class="row"><div><label for="f-h-end">Treatment ends</label><input type="date" id="f-h-end"></div>' +
     '<div><label for="f-h-follow">Follow-up check</label><input type="date" id="f-h-follow"></div></div>' +
     '<label for="f-h-note">Note</label><input type="text" id="f-h-note" placeholder="">';
@@ -1782,7 +2429,15 @@ function openHealthSheet(fishId){
         endDate:val('f-h-end') || '', followUp:val('f-h-follow') || '', note:val('f-h-note').trim()});
       save(); closeSheet(); savedToast('health entry'); render();
     }}
-  ]);
+  ], function(){
+    var cb = document.getElementById('f-h-calc');
+    if (cb) cb.addEventListener('click', function(){
+      var pid = currentPondId(f);
+      if (!pid){ toast('This fish has no pond right now — the dose calculator needs its pond\u2019s volume.', true); return; }
+      calcReturnFish = fishId;
+      openMedSheet(pid);
+    });
+  });
 }
 function openDeathSheet(fishId){
   var f = fishById(fishId); if (!f) return;
@@ -1884,7 +2539,8 @@ function openSpawnSheet(){
     '<div><label for="f-sp-hatch">Hatched (estimate)</label><input type="number" id="f-sp-hatch" inputmode="numeric" min="0" step="1"></div></div>' +
     '<label for="f-sp-hatchdate">Hatch date</label><input type="date" id="f-sp-hatchdate" value="' + todayStr() + '">' +
     '<div class="row"><div><label for="f-sp-batchname">Batch name</label><input type="text" id="f-sp-batchname" placeholder="e.g. Spring Fry"></div>' +
-    '<div><label for="f-sp-variety">Batch variety (expected)</label><select id="f-sp-variety">' + varietyOptions('Other / Mixed') + '</select></div></div>';
+    '<div><label for="f-sp-variety">Batch species / variety (expected)</label><select id="f-sp-variety">' + varietyOptions('Other / Mixed') + '</select></div></div>' +
+    varietyCustomHTML('f-sp-variety', 'Other / Mixed');
   openSheet('Record a spawn', body, [
     {label:'Cancel', cls:'ghost', onClick:closeSheet},
     {label:'🥚 Save spawn + batch', cls:'amber', onClick:function(){
@@ -1895,10 +2551,12 @@ function openSpawnSheet(){
       var sireIds = [];
       if (val('f-sp-sire1')) sireIds.push(val('f-sp-sire1'));
       if (val('f-sp-sire2') && val('f-sp-sire2') !== val('f-sp-sire1')) sireIds.push(val('f-sp-sire2'));
+      var spVariety = resolveVariety('f-sp-variety');
+      if (spVariety === null){ toast('Type the species / variety, or pick one from the list.', true); return; }
       state.seq = (state.seq || 0) + 1;
       var batch = {id:uid('b'), code:'B-' + state.seq, name: val('f-sp-batchname').trim() || ('Batch ' + state.seq),
         spawnId:null, pondId:pondId, hatchDate: val('f-sp-hatchdate') || todayStr(),
-        hatchEst: num(val('f-sp-hatch'), 0), variety: val('f-sp-variety'), forSale:false, askPrice:'', notes:''};
+        hatchEst: num(val('f-sp-hatch'), 0), variety: spVariety, forSale:false, askPrice:'', notes:''};
       var spawn = {id:uid('sp'), date: val('f-sp-date') || todayStr(), damId:damId, sireIds:sireIds,
         damName:'', sireName:'', pondId:pondId, method:val('f-sp-method').trim(),
         eggsEst: num(val('f-sp-eggs'), 0), hatchEst: batch.hatchEst, batchId: batch.id};
@@ -1908,26 +2566,29 @@ function openSpawnSheet(){
       save(); closeSheet(); savedToast('spawn recorded — ' + batch.name);
       detailBatchId = batch.id; currentTab = 'breed'; render();
     }}
-  ]);
+  ], function(){ wireVarietyCustom('f-sp-variety'); });
 }
 function openBatchEditSheet(bid){
   var b = batchById(bid); if (!b) return;
   var body = '<label for="f-b-name">Batch name</label><input type="text" id="f-b-name" value="' + esc(b.name) + '">' +
-    '<label for="f-b-variety">Variety (expected)</label><select id="f-b-variety">' + varietyOptions(b.variety || 'Other / Mixed') + '</select>' +
+    '<label for="f-b-variety">Species / variety (expected)</label><select id="f-b-variety">' + varietyOptions(b.variety || 'Other / Mixed') + '</select>' +
+    varietyCustomHTML('f-b-variety', b.variety || 'Other / Mixed') +
     '<label style="display:flex; gap:10px; align-items:center; font-size:15px; color:var(--ink); font-weight:400;"><input type="checkbox" id="f-b-forsale"' + (b.forSale ? ' checked' : '') + '> Batch is for sale</label>' +
     '<label for="f-b-ask">Asking price per fry ($)</label><input type="number" id="f-b-ask" inputmode="decimal" min="0" step="0.01" value="' + (b.askPrice === '' || b.askPrice === null || b.askPrice === undefined ? '' : b.askPrice) + '">' +
     '<label for="f-b-notes">Notes</label><textarea id="f-b-notes">' + esc(b.notes) + '</textarea>';
   openSheet('Edit ' + b.name, body, [
     {label:'Cancel', cls:'ghost', onClick:closeSheet},
     {label:'✓ Save', cls:'amber', onClick:function(){
+      var bVariety = resolveVariety('f-b-variety');
+      if (bVariety === null){ toast('Type the species / variety, or pick one from the list.', true); return; }
       b.name = val('f-b-name').trim() || b.name;
-      b.variety = val('f-b-variety');
+      b.variety = bVariety;
       b.forSale = document.getElementById('f-b-forsale').checked;
       b.askPrice = val('f-b-ask') === '' ? '' : round2(val('f-b-ask'));
       b.notes = val('f-b-notes').trim();
       save(); closeSheet(); savedToast(b.name); render();
     }}
-  ]);
+  ], function(){ wireVarietyCustom('f-b-variety'); });
 }
 function openBatchMoveSheet(bid){
   var b = batchById(bid); if (!b) return;
@@ -1979,7 +2640,8 @@ function openGraduateSheet(bid){
   var now = batchCountNow(b);
   var body = '<p class="small" style="margin-top:0;">Graduating turns fry from <b>' + esc(b.name) + '</b> (' + now + ' in the batch) into individual fish records — each with its own photo slot, growth chart, journey, and the pedigree from this batch\u2019s parents' + (s ? ' (' + esc(spawnParentsText(s)) + ')' : '') + '.</p>' +
     '<label for="f-g-count">How many to graduate</label><input type="number" id="f-g-count" inputmode="numeric" min="1" step="1" value="1">' +
-    '<label for="f-g-variety">Variety for these fish</label><select id="f-g-variety">' + varietyOptions(b.variety || 'Other / Mixed') + '</select>' +
+    '<label for="f-g-variety">Species / variety for these fish</label><select id="f-g-variety">' + varietyOptions(b.variety || 'Other / Mixed') + '</select>' +
+    varietyCustomHTML('f-g-variety', b.variety || 'Other / Mixed') +
     '<label for="f-g-pond">They will live in</label><select id="f-g-pond">' + pondOptions(b.pondId, false) + '</select>' +
     '<div class="row"><div><label for="f-g-prefix">Name prefix (optional)</label><input type="text" id="f-g-prefix" placeholder="e.g. Spring"></div>' +
     '<div><label for="f-g-size">Size now (inches, optional)</label><input type="number" id="f-g-size" inputmode="decimal" min="0" step="0.01"></div></div>';
@@ -1991,12 +2653,14 @@ function openGraduateSheet(bid){
       if (n > now){ toast('Only ' + now + ' fry in the batch.', true); return; }
       var pondId = val('f-g-pond');
       if (!pondId){ toast('Pick where they will live.', true); return; }
+      var gVariety = resolveVariety('f-g-variety');
+      if (gVariety === null){ toast('Type the species / variety, or pick one from the list.', true); return; }
       var prefix = val('f-g-prefix').trim();
       var size = num(val('f-g-size'), 0);
       var year = String(new Date().getFullYear());
       for (var i = 0; i < n; i++){
         state.seq = (state.seq || 0) + 1;
-        var rec = {id:uid('f'), code:'K-' + state.seq, name: prefix ? prefix + ' ' + (i + 1) : '', variety:val('f-g-variety'),
+        var rec = {id:uid('f'), code:'K-' + state.seq, name: prefix ? prefix + ' ' + (i + 1) : '', variety:gVariety,
           pattern:'', sex:'U', butterfly:false, bornYear: year, source:'bred', breeder:'',
           sireId: s && s.sireIds && s.sireIds.length ? s.sireIds[0] : null, damId: s ? s.damId : null,
           sireName:'', damName:'', cost:'', forSale:false, askPrice:'', photo:'', notes:'Graduated from ' + b.name, status:'active', batchId:b.id};
@@ -2007,7 +2671,7 @@ function openGraduateSheet(bid){
       setBatchCount(b, todayStr(), now - n, 'graduate', 'Graduated ' + n + ' to individual fish records');
       save(); closeSheet(); savedToast(n + ' fish graduated'); render();
     }}
-  ]);
+  ], function(){ wireVarietyCustom('f-g-variety'); });
 }
 
 /* ---------- Sale / customer / waitlist / money forms ---------- */
@@ -2189,6 +2853,7 @@ function handleAct(act, id){
   }
   /* fish */
   else if (act === 'fish-add') openFishSheet(null);
+  else if (act === 'fish-batch') openBatchFishSheet(null);
   else if (act === 'fish-open'){ detailFishId = id; currentTab = 'fish'; render(); }
   else if (act === 'fish-back'){ detailFishId = null; render(); }
   else if (act === 'fish-edit') openFishSheet(id);
@@ -2222,6 +2887,51 @@ function handleAct(act, id){
   }
   /* ponds */
   else if (act === 'pond-add') openPondSheet(null);
+  else if (act === 'calc-salt') openSaltSheet(id);
+  else if (act === 'calc-med'){ calcReturnFish = null; openMedSheet(id); }
+  else if (act === 'calc-kh') openKHSheet(id);
+  else if (act === 'trend-param'){
+    var tp = String(id || '').split('|');
+    if (tp.length === 2){ trendParamByPond[tp[0]] = tp[1]; render(); }
+  }
+  else if (act === 'ration-curve'){
+    var rc = String(id || '').split('|');
+    var rp = pondById(rc[0]);
+    if (rp && (rc[1] === 'koi' || rc[1] === 'generic')){ rp.rationCurve = rc[1]; save(); render(); }
+  }
+  else if (act === 'feed-ration'){
+    var rr = pondRation(id);
+    openFeedSheet(id);
+    if (rr && rr.gramsPerDay > 0){
+      var amtEl = document.getElementById('f-fd-amount');
+      if (amtEl) amtEl.value = Math.round(rr.gramsPerDay / 453.592 * 100) / 100;
+    }
+  }
+  else if (act === 'task-add') openTaskSheet(id);
+  else if (act === 'task-done'){
+    var tk = taskById(id);
+    if (tk){ tk.lastDone = todayStr(); tk.nextDue = addDaysStr(todayStr(), Math.max(1, Math.floor(Number(tk.everyDays) || 7))); save(); savedToast(tk.name + ' — next due ' + fmtDate(tk.nextDue)); render(); }
+  }
+  else if (act === 'task-snooze'){
+    var ts2 = taskById(id);
+    if (ts2){ ts2.nextDue = addDaysStr(todayStr(), 1); save(); toast('Snoozed to tomorrow'); render(); }
+  }
+  else if (act === 'task-del'){
+    var td = taskById(id); if (!td) return;
+    confirmSheet('Delete this repeating task?', '<p>“' + esc(td.name) + '” on ' + esc(pondName(td.pondId)) + ' — every ' + td.everyDays + ' days. The task leaves the schedule; nothing else is touched.</p>', 'Delete task', function(){
+      state.tasks = state.tasks.filter(function(x){ return x.id !== id; });
+      save(); closeSheet(); toast('Task deleted'); render();
+    });
+  }
+  else if (act === 'ics-export') exportICS();
+  else if (act === 'export-csv') exportWaterCSV();
+  else if (act === 'fish-passport') printFishPassport(id, null);
+  else if (act === 'sale-print'){
+    var sp = null;
+    state.sales.forEach(function(s){ if (s.id === id) sp = s; });
+    if (sp && sp.kind === 'fish' && sp.fishId) printFishPassport(sp.fishId, sp);
+    else toast('Certificates are for individual fish sales.', true);
+  }
   else if (act === 'pond-open'){ detailPondId = id; currentTab = 'ponds'; render(); }
   else if (act === 'pond-back'){ detailPondId = null; render(); }
   else if (act === 'pond-edit') openPondSheet(id);
@@ -2397,6 +3107,75 @@ function importData(){
   });
   inp.click();
 }
+/* ---------- Fish passport / sale certificate (print) ---------- */
+function printFishPassport(fid, sale){
+  var f = fishById(fid); if (!f) return;
+  var sire = fishById(f.sireId), dam = fishById(f.damId);
+  var gs = fishGrowth(f.id), ms = fishMoves(f.id);
+  var hs = state.health.filter(function(x){ return x.fishId === f.id; }).sort(function(a, b){ return a.date < b.date ? -1 : 1; });
+  var h = '<h1>' + (sale ? 'Sale Certificate' : 'Fish Passport') + ' — ' + esc(f.name || f.code) + '</h1>';
+  h += '<p>' + esc(state.farmName || APP_NAME) + ' · Printed ' + fmtDate(todayStr()) + '</p>';
+  if (f.photo) h += '<img src="' + f.photo + '" alt="Photo of the fish" style="max-width:340px; max-height:340px; border-radius:8px;">';
+  h += '<table>' +
+    '<tr><td><b>Fish</b></td><td>' + esc(fishLabel(f)) + '</td></tr>' +
+    '<tr><td><b>Species / variety</b></td><td>' + esc(f.variety) + (f.pattern ? ' — ' + esc(f.pattern) : '') + (f.butterfly ? ' · butterfly / longfin' : '') + '</td></tr>' +
+    '<tr><td><b>Sex</b></td><td>' + (f.sex === 'F' ? 'Female' : f.sex === 'M' ? 'Male' : 'Unknown') + '</td></tr>' +
+    (f.bornYear ? '<tr><td><b>Born / hatched</b></td><td>' + esc(f.bornYear) + '</td></tr>' : '') +
+    '<tr><td><b>Sire (father)</b></td><td>' + (sire ? esc(fishLabel(sire)) + ' — ' + esc(sire.variety) : (f.sireName ? esc(f.sireName) + ' (not in this book)' : '—')) + '</td></tr>' +
+    '<tr><td><b>Dam (mother)</b></td><td>' + (dam ? esc(fishLabel(dam)) + ' — ' + esc(dam.variety) : (f.damName ? esc(f.damName) + ' (not in this book)' : '—')) + '</td></tr>' +
+    '<tr><td><b>Source</b></td><td>' + (f.source === 'bred' ? 'Bred by the seller' : 'Bought in' + (f.breeder ? ' — ' + esc(f.breeder) : '')) + '</td></tr>' +
+    '</table>';
+  if (gs.length){
+    h += '<h2>Size history</h2><table><tr><th>Date</th><th>Length</th><th>Weight</th></tr>';
+    gs.forEach(function(g){ h += '<tr><td>' + fmtDate(g.date) + '</td><td>' + fmtLen(g.lenIn) + '</td><td>' + (g.weightLb ? esc(g.weightLb) + ' lb' : '—') + '</td></tr>'; });
+    h += '</table>';
+  }
+  if (ms.length){
+    h += '<h2>Journey — everywhere this fish has lived</h2><table><tr><th>Date</th><th>From</th><th>To</th><th>Why</th></tr>';
+    ms.forEach(function(m){
+      h += '<tr><td>' + fmtDate(m.date) + '</td><td>' + (m.fromPondId ? esc(pondName(m.fromPondId)) : 'Arrived') + '</td><td>' + (m.toPondId ? esc(pondName(m.toPondId)) : (m.reason === 'Sold' ? 'Sold' : m.reason)) + '</td><td>' + esc(m.reason) + (m.note ? ' — ' + esc(m.note) : '') + '</td></tr>';
+    });
+    h += '</table>';
+  }
+  if (hs.length){
+    h += '<h2>Health summary</h2><table><tr><th>Date</th><th>What</th><th>Treatment</th></tr>';
+    hs.forEach(function(x){
+      h += '<tr><td>' + fmtDate(x.date) + '</td><td>' + (x.type === 'mortality' ? 'Died — ' : '') + esc(x.diagnosis || x.symptoms || 'Health entry') + '</td><td>' + esc(x.treatment || '') + (x.dose ? ' (' + esc(x.dose) + ')' : '') + '</td></tr>';
+    });
+    h += '</table>';
+  }
+  if (sale){
+    h += '<h2>Sale</h2><table>' +
+      '<tr><td><b>Buyer</b></td><td>' + esc(customerName(sale.customerId)) + '</td></tr>' +
+      '<tr><td><b>Date</b></td><td>' + fmtDate(sale.date) + '</td></tr>' +
+      '<tr><td><b>Price</b></td><td>' + money(sale.price) + '</td></tr>' +
+      (state.farmName ? '<tr><td><b>Sold by</b></td><td>' + esc(state.farmName) + '</td></tr>' : '') +
+      '</table>';
+  }
+  h += '<p style="margin-top:14px;">Records kept in ' + APP_NAME + ' — every entry above comes from the keeper\u2019s own book.</p>';
+  document.getElementById('printArea').innerHTML = h;
+  window.print();
+}
+function exportWaterCSV(){
+  if (!state.water.length){ toast('No water tests to export yet.', true); return; }
+  function cell(v){ v = v === null || v === undefined ? '' : String(v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
+  var head = ['Date', 'Pond'].concat(WATER_PARAMS.map(function(wp){ return wp.label + (wp.unit ? ' (' + wp.unit + ')' : ''); })).concat(['Note']);
+  var rows = [head.join(',')];
+  state.water.slice().sort(function(a, b){ return a.date < b.date ? -1 : 1; }).forEach(function(w){
+    var row = [w.date, pondName(w.pondId)];
+    WATER_PARAMS.forEach(function(wp){ row.push(w[wp.key] === '' || w[wp.key] === null || w[wp.key] === undefined ? '' : w[wp.key]); });
+    row.push(w.note || '');
+    rows.push(row.map(cell).join(','));
+  });
+  var blob = new Blob([rows.join('\n')], {type:'text/csv'});
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'koibook-water-tests.csv';
+  document.body.appendChild(a); a.click();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 400);
+  toast('Water tests CSV downloaded ✓');
+}
+
 function printSummary(){
   var today = todayStr();
   var wk = moneyInRange(weekStartStr(), today), mo = moneyInRange(monthStartStr(), today), all = moneyInRange('0000-01-01', '9999-12-31');
@@ -2528,11 +3307,12 @@ function matchFishInText(t, rawLower){
     if (f.name && rawLower.indexOf(f.name.toLowerCase()) >= 0) return {fish:f};
     if (rawLower.indexOf(f.code.toLowerCase()) >= 0) return {fish:f};
   }
-  for (i = 0; i < VARIETIES.length; i++){
-    if (t.indexOf(' ' + VARIETIES[i].toLowerCase() + ' ') >= 0 || t.indexOf(' ' + VARIETIES[i].toLowerCase().split(' ')[0] + ' ') >= 0){
-      var cands = live.filter(function(x){ return x.variety === VARIETIES[i]; });
+  var ALL = allVarieties();
+  for (i = 0; i < ALL.length; i++){
+    if (t.indexOf(' ' + ALL[i].toLowerCase() + ' ') >= 0 || t.indexOf(' ' + ALL[i].toLowerCase().split(' ')[0] + ' ') >= 0){
+      var cands = live.filter(function(x){ return x.variety === ALL[i]; });
       if (cands.length === 1) return {fish:cands[0]};
-      if (cands.length > 1) return {ambiguous: VARIETIES[i]};
+      if (cands.length > 1) return {ambiguous: ALL[i]};
     }
   }
   return {};
@@ -2577,7 +3357,7 @@ function parseTell(raw){
     if (!got.length){ out.problems.push('Tell heard a pond but no readings — try “pond one pH 7.4 ammonia 0”.'); return out; }
     out.water = rec;
     out.lines.push('Water test for ' + pond.name + ', today: ' + got.map(function(wp){ return wp.label + ' ' + (wp.key === 'tempF' ? fmtTemp(rec[wp.key]) : rec[wp.key] + (wp.unit ? ' ' + wp.unit : '')); }).join(' · '));
-    got.forEach(function(wp){ var fl = waterFlag(wp.key, rec[wp.key]); if (fl && fl.cls !== 'ok') out.lines.push('⚠ ' + wp.label + ' reads ' + fl.label.toLowerCase() + ' for koi — see the Water page for the range.'); });
+    got.forEach(function(wp){ var fl = waterFlag(wp.key, rec[wp.key], pondById(rec.pondId)); if (fl && fl.cls !== 'ok') out.lines.push('⚠ ' + wp.label + ' reads ' + fl.label.toLowerCase() + ' for fish — see the Water page for the range.'); });
     return out;
   }
   /* 2. sale */
