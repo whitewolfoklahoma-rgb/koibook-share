@@ -137,6 +137,38 @@ a.sup-buy:hover{background:var(--soft);}
 .ww-legal-check input{width:22px;height:22px;min-width:22px;margin-top:1px;cursor:pointer}
 [hidden]{display:none !important}
 </style>
+<style>
+/* ===== KoiBook v1.2.0: modern app-look redesign (BirdTally pattern, deep-pond teal palette) ===== */
+:root{--bar-h:64px}
+body{padding-bottom:calc(var(--bar-h) + env(safe-area-inset-bottom) + 20px)}
+header.app{position:sticky;top:0;z-index:40;background:linear-gradient(135deg,#082f3a,var(--deep) 55%,var(--teal));box-shadow:0 2px 12px rgba(11,61,74,.35);padding:14px 16px 12px}
+header.app .brand{display:flex;align-items:center;gap:10px}
+nav.tabs{position:fixed;left:0;right:0;bottom:0;top:auto;z-index:60;background:rgba(255,255,255,.97);border-top:1px solid var(--line);box-shadow:0 -3px 16px rgba(11,61,74,.14);padding:6px 8px calc(6px + env(safe-area-inset-bottom));gap:2px}
+nav.tabs button{flex:1;min-width:0;background:none;color:var(--muted);border-radius:14px;min-height:56px;padding:4px 1px 5px;font-size:11.5px;font-weight:700;display:flex;align-items:center;justify-content:center;text-align:center;line-height:1.25}
+nav.tabs button:hover{background:rgba(14,110,110,.06)}
+nav.tabs button.active{background:var(--amber);color:#3a2c05;box-shadow:0 2px 6px rgba(232,161,58,.45)}
+main#view > .card,main#view > .grid,main#view > h2.view-title{animation:tabInSoft .25s ease both}
+@keyframes tabInSoft{from{opacity:.3;transform:translateY(4px)}to{opacity:1;transform:none}}
+.card,.stat{border-radius:16px;box-shadow:0 2px 6px rgba(11,61,74,.07),0 10px 26px rgba(11,61,74,.08)}
+button.btn{border-radius:999px}
+button.btn.small{min-height:44px}
+button{transition:background .15s,transform .1s}
+button:active{transform:scale(.98)}
+input,select,textarea{border-radius:12px}
+.tray-actions button{border-radius:999px;min-height:44px}
+#toast{bottom:calc(var(--bar-h) + env(safe-area-inset-bottom) + 14px)}
+.sheet{border-radius:20px 20px 0 0}
+/* welcome-screen terms gate (ww-legal pattern, restyled) */
+.ww-legal-overlay{background:rgba(8,47,58,.72)}
+.ww-legal-card{border-radius:22px;padding:26px 20px 22px;box-shadow:0 18px 44px rgba(0,0,0,.35)}
+.ww-legal-card::before{content:"\1F38F";display:block;text-align:center;font-size:66px;line-height:1.1}
+.ww-legal-card h2{text-align:center;font-size:27px;font-weight:800;color:#0b3d4a;margin-top:2px}
+.ww-legal-card h2::after{content:"Welcome! Your fish, ponds, breeding, water, and sales — kept simple.";display:block;font-size:15px;font-weight:600;color:#65787c;margin-top:4px}
+.ww-legal-card h3{text-align:center}
+.ww-legal-btn{border-radius:999px}
+.ww-legal-agree{background:#0e6e6e;border-color:#0e6e6e;min-height:56px;font-size:17px}
+@media print{nav.tabs{display:none !important}body{padding-bottom:0}}
+</style>
 </head>
 <body>
 <header class="app">
@@ -158,7 +190,7 @@ a.sup-buy:hover{background:var(--soft);}
 </div>
 
 <div id="toast"></div>
-<footer class="app">KoiBook v1.1 · Runs 100% offline. Your data never leaves this device — it lives in your browser's storage.</footer>
+<footer class="app">KoiBook v1.2.0 · Runs 100% offline. Your data never leaves this device — it lives in your browser's storage.</footer>
 
 <div id="wwLegalOverlay" class="ww-legal-overlay" hidden>
   <div class="ww-legal-card" role="dialog" aria-modal="true" aria-labelledby="wwLegalTitle">
@@ -185,14 +217,14 @@ a.sup-buy:hover{background:var(--soft);}
 <script>
 'use strict';
 /* ================================================================
-   KoiBook v1.1 — keeper / breeder / seller tracker for koi.
+   KoiBook v1.2 — keeper / breeder / seller tracker for koi.
    Single-file app. All data in localStorage under one key
    (koibook_v1). Offline; no accounts, no server.
    One source of truth (§10): a fish's current pond is ALWAYS
    derived from its move history — never stored twice.
    ================================================================ */
 var APP_NAME = 'KoiBook';
-var APP_VERSION = '1.1.1';
+var APP_VERSION = '1.2.0';
 var TERMS_VERSION = '1.0';
 var LS_KEY = 'koibook_v1';
 var LS_TERMS_KEY = 'koibook_v1_terms';
